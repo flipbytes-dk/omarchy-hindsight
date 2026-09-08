@@ -1,0 +1,1224 @@
+#!/usr/bin/env python3
+"""Hindsight - an always-on, local, searchable memory of your screen.
+
+Everything that can go wrong lives here rather than in QML: the capture loop,
+the change detection that keeps the disk from filling, the OCR queue, the
+blocklist that decides a frame must never exist, and the pruning. The shell
+side only renders what this prints.
+
+Nothing here ever opens a network socket. That is a design constraint, not an
+implementation detail - see doctor().
+"""
+
+import difflib
+import json
+import os
+import queue
+import re
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+
+HOME = os.path.expanduser("~")
+DATA = os.environ.get("HINDSIGHT_DATA") or os.path.join(
+    os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share"),
+    "omarchy-hindsight")
+CONFIG = os.environ.get("HINDSIGHT_CONFIG") or os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"),
+    "omarchy-hindsight", "config.json")
+
+FRAMES = os.path.join(DATA, "frames")
+DB_PATH = os.path.join(DATA, "index.db")
+STATE_PATH = os.path.join(DATA, "state.json")
+PAUSE_MARKER = os.path.join(DATA, "paused")
+
+# A screen that differs from the last kept frame in fewer than this many of the
+# 1024 hash bits is the same screen with a blinking cursor on it. Storing those
+# is what turns a screen history into a disk-eating toy.
+DEFAULTS = {
+    "interval": 4.0,
+    "budgetMB": 4096,
+    "retentionDays": 0,
+    "quality": 60,
+    "changeBits": 12,
+    "ocr": True,
+    "ocrTimeout": 25,
+    "blocklist": [
+        "1password", "bitwarden", "keepassxc", "keepass", "gnome-keyring",
+        "seahorse", "private browsing", "incognito", "inprivate",
+        # A screensaver is idle time wearing a picture. Capturing it wastes
+        # disk and, because its few words score highly, poisons search.
+        "screensaver", "org.omarchy.screensaver",
+    ],
+    "blocklistTitles": [],
+    "captureOnBattery": True,
+}
+
+HASH_N = 32          # 32x32 grid -> 1024-bit average hash
+HASH_BITS = HASH_N * HASH_N
+MIN_RESULT_CHARS = 60  # below this a frame carries no context worth showing
+# Capture keeps anything past a 12-bit change, which is right for an archive
+# but wrong for a result list: three near-identical frames are one moment, and
+# showing them three times spends the list on nothing.
+RESULT_SAME_MOMENT_BITS = 60
+OCR_QUEUE_MAX = 8    # bounded: OCR is ~1.5s, capture is ~40ms; drop, never lag
+
+
+# --------------------------------------------------------------------------
+# config + paths
+
+
+def load_config():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG, "r", encoding="utf-8") as fh:
+            user = json.load(fh)
+        if isinstance(user, dict):
+            for key, value in user.items():
+                if key in cfg and value is not None:
+                    cfg[key] = value
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        log("config unreadable (%s), using defaults" % exc)
+    cfg["interval"] = max(1.0, float(cfg["interval"]))
+    cfg["changeBits"] = max(0, int(cfg["changeBits"]))
+    cfg["budgetMB"] = max(64, int(cfg["budgetMB"]))
+    return cfg
+
+
+def log(message):
+    sys.stderr.write("hindsight: %s\n" % message)
+    sys.stderr.flush()
+
+
+def ensure_dirs():
+    os.makedirs(FRAMES, exist_ok=True)
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+
+
+# --------------------------------------------------------------------------
+# database
+
+
+def connect():
+    ensure_dirs()
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS frames(
+            id INTEGER PRIMARY KEY,
+            ts REAL NOT NULL,
+            day TEXT NOT NULL,
+            path TEXT NOT NULL,
+            app TEXT,
+            title TEXT,
+            monitor TEXT,
+            hash TEXT,
+            bytes INTEGER DEFAULT 0,
+            ocr INTEGER DEFAULT 0
+        )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS frames_ts ON frames(ts)")
+    conn.execute("CREATE INDEX IF NOT EXISTS frames_day ON frames(day)")
+    conn.execute("CREATE INDEX IF NOT EXISTS frames_ocr ON frames(ocr)")
+    # The FTS table keeps its own copy of the text. That is deliberate: a
+    # contentless table can match a query but cannot produce snippet(), and a
+    # search result with no visible words is not a search result. The text is
+    # a rounding error next to the images.
+    migrate_fts(conn)
+    conn.execute("""
+        CREATE VIRTUAL TABLE IF NOT EXISTS frames_fts
+        USING fts5(text, app, title)""")
+    conn.commit()
+    return conn
+
+
+def migrate_fts(conn):
+    """Rebuild a contentless frames_fts from an earlier version in place.
+
+    Frames keep their images, so the text is recoverable: everything is marked
+    un-read and the backfill worker re-reads it from the stored frame.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='frames_fts'"
+    ).fetchone()
+    if not row or not row[0] or "content=''" not in row[0].replace(" ", ""):
+        return
+    log("rebuilding search index (was contentless); frames will be re-read")
+    conn.execute("DROP TABLE frames_fts")
+    conn.execute("UPDATE frames SET ocr=0")
+    conn.commit()
+
+
+def fts_supported():
+    try:
+        probe = sqlite3.connect(":memory:")
+        probe.execute("CREATE VIRTUAL TABLE t USING fts5(a)")
+        probe.close()
+        return True
+    except Exception:
+        return False
+
+
+# --------------------------------------------------------------------------
+# perceptual hash, in pure Python straight off the PPM
+#
+# This is the hot path: it runs on every tick whether or not anything is kept,
+# so it must not spawn a process. Measured at 0.4ms for 1280x800.
+
+
+def parse_ppm(buf):
+    """Return (width, height, offset) for a binary P6 PPM, or None."""
+    if not buf.startswith(b"P6"):
+        return None
+    i = 2
+    fields = []
+    while len(fields) < 3:
+        while i < len(buf) and buf[i:i + 1].isspace():
+            i += 1
+        if buf[i:i + 1] == b"#":
+            while i < len(buf) and buf[i:i + 1] != b"\n":
+                i += 1
+            continue
+        j = i
+        while j < len(buf) and not buf[j:j + 1].isspace():
+            j += 1
+        if j >= len(buf):
+            return None
+        try:
+            fields.append(int(buf[i:j]))
+        except ValueError:
+            return None
+        i = j
+    return fields[0], fields[1], i + 1
+
+
+def average_hash(buf):
+    parsed = parse_ppm(buf)
+    if not parsed:
+        return None
+    width, height, offset = parsed
+    if width <= 0 or height <= 0:
+        return None
+    samples = []
+    append = samples.append
+    for gy in range(HASH_N):
+        row = offset + ((gy * height) // HASH_N) * width * 3
+        for gx in range(HASH_N):
+            o = row + ((gx * width) // HASH_N) * 3
+            if o + 2 >= len(buf):
+                return None
+            append((buf[o] * 299 + buf[o + 1] * 587 + buf[o + 2] * 114) // 1000)
+    mean = sum(samples) // len(samples)
+    bits = 0
+    for index, value in enumerate(samples):
+        if value > mean:
+            bits |= 1 << index
+    return bits
+
+
+def distance(a, b):
+    if a is None or b is None:
+        return HASH_BITS
+    return bin(a ^ b).count("1")
+
+
+# --------------------------------------------------------------------------
+# desktop probes
+
+
+def run(cmd, timeout=5, stdin_bytes=None):
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, timeout=timeout, input=stdin_bytes)
+        return proc.returncode, proc.stdout, proc.stderr
+    except FileNotFoundError:
+        return 127, b"", b"missing"
+    except subprocess.TimeoutExpired:
+        return 124, b"", b"timeout"
+    except Exception as exc:
+        return 1, b"", str(exc).encode()
+
+
+def active_window():
+    code, out, _ = run(["hyprctl", "activewindow", "-j"], timeout=3)
+    if code != 0:
+        return "", ""
+    try:
+        data = json.loads(out.decode("utf-8", "replace") or "{}")
+    except Exception:
+        return "", ""
+    if not isinstance(data, dict):
+        return "", ""
+    return str(data.get("class") or ""), str(data.get("title") or "")
+
+
+def focused_monitor():
+    """Name of the focused output, and whether its screen is actually on."""
+    code, out, _ = run(["hyprctl", "monitors", "-j"], timeout=3)
+    if code != 0:
+        return None, True
+    try:
+        monitors = json.loads(out.decode("utf-8", "replace") or "[]")
+    except Exception:
+        return None, True
+    if not isinstance(monitors, list) or not monitors:
+        return None, True
+    chosen = None
+    for mon in monitors:
+        if isinstance(mon, dict) and mon.get("focused"):
+            chosen = mon
+            break
+    if chosen is None:
+        chosen = monitors[0]
+    # dpmsStatus False means the panel is asleep; grim would hand back a stale
+    # or black frame and we would archive darkness.
+    awake = chosen.get("dpmsStatus", True) is not False
+    return str(chosen.get("name") or "") or None, awake
+
+
+def session_locked():
+    if subprocess.run(["pgrep", "-x", "hyprlock"],
+                      capture_output=True).returncode == 0:
+        return True
+    code, out, _ = run(["loginctl", "show-session", "self",
+                        "-p", "LockedHint", "--value"], timeout=3)
+    if code == 0 and out.decode("utf-8", "replace").strip() == "yes":
+        return True
+    return False
+
+
+def blocked_by(cfg, app, title):
+    """Return the matching rule, or '' - the frame is never taken if set."""
+    hay_app = (app or "").lower()
+    hay_title = (title or "").lower()
+    for needle in cfg.get("blocklist") or []:
+        token = str(needle).lower().strip()
+        if token and (token in hay_app or token in hay_title):
+            return str(needle)
+    for pattern in cfg.get("blocklistTitles") or []:
+        try:
+            if re.search(str(pattern), title or "", re.I):
+                return str(pattern)
+        except re.error:
+            continue
+    return ""
+
+
+def capture(monitor):
+    cmd = ["grim", "-t", "ppm"]
+    if monitor:
+        cmd += ["-o", monitor]
+    cmd.append("-")
+    code, out, err = run(cmd, timeout=10)
+    if code != 0 or not out:
+        return None, err.decode("utf-8", "replace").strip()
+    return out, ""
+
+
+def encode_webp(ppm, quality):
+    code, out, err = run(
+        ["magick", "ppm:-", "-quality", str(quality), "webp:-"],
+        timeout=20, stdin_bytes=ppm)
+    if code != 0 or not out:
+        return None, err.decode("utf-8", "replace").strip()
+    return out, ""
+
+
+def ocr_frame_file(path, timeout):
+    """Recover text from a frame already on disk, via its stored image."""
+    code, ppm, _ = run(["magick", path, "ppm:-"], timeout=20)
+    if code != 0 or not ppm:
+        return None
+    return ocr_text(ppm, timeout)
+
+
+def ocr_text(ppm, timeout):
+    code, out, _ = run(["nice", "-n", "19", "tesseract", "-", "stdout",
+                        "--psm", "6"], timeout=timeout, stdin_bytes=ppm)
+    if code != 0:
+        return ""
+    text = out.decode("utf-8", "replace")
+    # tesseract emits a lot of whitespace scaffolding around real words.
+    lines = [" ".join(line.split()) for line in text.splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
+# --------------------------------------------------------------------------
+# storage
+
+
+def frame_path(ts):
+    day = time.strftime("%Y-%m-%d", time.localtime(ts))
+    name = time.strftime("%H%M%S", time.localtime(ts))
+    directory = os.path.join(FRAMES, day)
+    os.makedirs(directory, exist_ok=True)
+    return day, os.path.join(directory, "%s-%03d.webp" % (name, int(ts * 1000) % 1000))
+
+
+def store(conn, ts, path, app, title, monitor, hash_bits, size):
+    day = time.strftime("%Y-%m-%d", time.localtime(ts))
+    cur = conn.execute(
+        "INSERT INTO frames(ts,day,path,app,title,monitor,hash,bytes,ocr)"
+        " VALUES(?,?,?,?,?,?,?,?,0)",
+        (ts, day, path, app, title, monitor, str(hash_bits), size))
+    conn.commit()
+    return cur.lastrowid
+
+
+def attach_text(conn, frame_id, text, app, title):
+    conn.execute("DELETE FROM frames_fts WHERE rowid=?", (frame_id,))
+    conn.execute(
+        "INSERT INTO frames_fts(rowid,text,app,title) VALUES(?,?,?,?)",
+        (frame_id, text, app or "", title or ""))
+    conn.execute("UPDATE frames SET ocr=1 WHERE id=?", (frame_id,))
+    conn.commit()
+
+
+def drop_frames(conn, rows):
+    """Delete frames from disk and both tables. rows is [(id, path), ...]."""
+    removed = 0
+    for frame_id, path in rows:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log("could not remove %s (%s)" % (path, exc))
+            continue
+        conn.execute("DELETE FROM frames WHERE id=?", (frame_id,))
+        conn.execute("DELETE FROM frames_fts WHERE rowid=?", (frame_id,))
+        removed += 1
+    if removed:
+        conn.commit()
+    return removed
+
+
+def prune(conn, cfg):
+    """Ring-buffer the archive: oldest frames go first, by age then by size."""
+    removed = 0
+    days = int(cfg.get("retentionDays") or 0)
+    if days > 0:
+        cutoff = time.time() - days * 86400
+        rows = conn.execute(
+            "SELECT id,path FROM frames WHERE ts<? ORDER BY ts", (cutoff,)
+        ).fetchall()
+        removed += drop_frames(conn, rows)
+
+    budget = int(cfg["budgetMB"]) * 1024 * 1024
+    # Checkpoint first: an unflushed WAL can be larger than the database and
+    # would otherwise be charged to the user as if it were frames.
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.Error:
+        pass
+    # The index counts too, but it must never eat the whole budget: leave at
+    # least half for frames so a fat index cannot prune the archive to nothing.
+    room = max(budget // 2, budget - index_bytes())
+    total = conn.execute("SELECT COALESCE(SUM(bytes),0) FROM frames").fetchone()[0]
+    budget = room
+    if total > budget:
+        # Materialise the candidates first: deleting rows from under a live
+        # cursor on the same table silently skips frames, so the archive would
+        # creep over budget forever.
+        doomed = []
+        running = total
+        for frame_id, path, size in conn.execute(
+                "SELECT id,path,bytes FROM frames ORDER BY ts").fetchall():
+            if running <= budget:
+                break
+            doomed.append((frame_id, path))
+            running -= int(size or 0)
+        removed += drop_frames(conn, doomed)
+    if removed:
+        empty_dirs()
+    return removed
+
+
+def empty_dirs():
+    try:
+        for day in os.listdir(FRAMES):
+            path = os.path.join(FRAMES, day)
+            if os.path.isdir(path) and not os.listdir(path):
+                os.rmdir(path)
+    except OSError:
+        pass
+
+
+def usage(conn):
+    row = conn.execute(
+        "SELECT COUNT(*), COALESCE(SUM(bytes),0) FROM frames").fetchone()
+    return int(row[0]), int(row[1])
+
+
+def index_bytes():
+    """The database is not free: the recognised text of every frame lives in
+    it, and it was not being counted against the budget at all."""
+    total = 0
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            total += os.path.getsize(DB_PATH + suffix)
+        except OSError:
+            pass
+    return total
+
+
+def disk_usage(conn):
+    """Everything this plugin actually occupies, images and index alike."""
+    frames, images = usage(conn)
+    return frames, images + index_bytes()
+
+
+# --------------------------------------------------------------------------
+# capacity: how far back a given disk budget actually reaches
+#
+# Gigabytes are a unit nobody thinks in. "About three weeks" is. The honest
+# translation between the two depends entirely on how much a particular
+# screen changes, so the numbers below are a starting point that the user's
+# own history replaces as soon as there is enough of it.
+
+BOOTSTRAP_FRAME_BYTES = 88 * 1024   # measured: 1280x800 WebP at quality 60
+BOOTSTRAP_KEEP_RATIO = 0.15         # measured: dedup kept ~2 of 16 idle ticks
+ASSUMED_ACTIVE_HOURS = 8.0          # a working day, until we can count one
+GAP_CEILING = 300.0                 # a gap longer than this is away, not usage
+MIN_SAMPLE_FRAMES = 60
+# Half an hour of real use before the estimate trusts itself. Two minutes of
+# a scrolling terminal reads as 40 MB/hour and would tell a new user their
+# disk holds days when it holds weeks; the bootstrap figure is less wrong.
+MIN_SAMPLE_SECONDS = 1800.0
+BUDGET_CHOICES_MB = [512, 1024, 2048, 4096, 8192, 16384, 32768]
+
+
+def parse_size_mb(text):
+    """'8G' / '8gb' / '512M' / '4096' -> megabytes. None if unparseable."""
+    match = re.match(r"^\s*([0-9]*\.?[0-9]+)\s*([kmgt]?)b?\s*$",
+                     str(text or ""), re.IGNORECASE)
+    if not match:
+        return None
+    value = float(match.group(1))
+    scale = {"": 1.0, "k": 1.0 / 1024, "m": 1.0, "g": 1024.0, "t": 1024.0 * 1024}
+    megabytes = value * scale[match.group(2).lower()]
+    if megabytes < 1:
+        return None
+    return int(round(megabytes))
+
+
+def observed_rate(conn):
+    """Bytes written per second of *active* use, or None without a sample.
+
+    Gaps longer than GAP_CEILING are the machine being asleep, locked or
+    paused. Counting them would stretch the estimate to flattery."""
+    rows = conn.execute("SELECT ts,bytes FROM frames ORDER BY ts").fetchall()
+    if len(rows) < MIN_SAMPLE_FRAMES:
+        return None
+    active = 0.0
+    written = 0
+    for index in range(1, len(rows)):
+        gap = float(rows[index][0]) - float(rows[index - 1][0])
+        if 0 < gap <= GAP_CEILING:
+            active += gap
+            written += int(rows[index][1] or 0)
+    if active < MIN_SAMPLE_SECONDS or written <= 0:
+        return None
+    return written / active
+
+
+def complete_day_totals(conn):
+    """Bytes per day, excluding today and the oldest day - both are partial,
+    and a half day dragged into the average makes the estimate optimistic."""
+    rows = conn.execute(
+        "SELECT day, SUM(bytes) FROM frames GROUP BY day ORDER BY day").fetchall()
+    if len(rows) < 3:
+        return []
+    today = time.strftime("%Y-%m-%d")
+    return sorted(int(total or 0) for day, total in rows[1:]
+                  if day != today and total)
+
+
+def capacity(conn, cfg, budget_mb=None):
+    """What a budget buys, in time rather than bytes."""
+    interval = max(1.0, float(cfg.get("interval") or DEFAULTS["interval"]))
+    budget_mb = int(budget_mb if budget_mb else cfg["budgetMB"])
+    budget = budget_mb * 1024 * 1024
+
+    rate = observed_rate(conn)
+    basis = "sampled"
+    if rate is None:
+        rate = BOOTSTRAP_FRAME_BYTES * BOOTSTRAP_KEEP_RATIO / interval
+        basis = "default"
+
+    # Every kept frame drags its recognised text into the index, so both rates
+    # have to carry that overhead or the estimate runs optimistic. Applied
+    # before the daily figure is derived, since that is what sizes the budget.
+    frames, used = disk_usage(conn)
+    _, images = usage(conn)
+    overhead = max(1.0, float(used) / float(images)) if images > 0 else 1.0
+
+    per_hour = rate * 3600.0 * overhead
+    days_seen = complete_day_totals(conn)
+    if len(days_seen) >= 2:
+        middle = len(days_seen) // 2
+        per_day = overhead * float(days_seen[middle] if len(days_seen) % 2
+                                   else (days_seen[middle - 1]
+                                         + days_seen[middle]) / 2.0)
+        basis = "measured"
+    else:
+        per_day = per_hour * ASSUMED_ACTIVE_HOURS
+    per_day = max(per_day, 1.0)
+
+    return {
+        "budgetMB": budget_mb,
+        "budgetBytes": budget,
+        "usedBytes": used,
+        "frames": frames,
+        "bytesPerActiveHour": int(per_hour),
+        "bytesPerDay": int(per_day),
+        "coverageHours": budget / per_hour if per_hour > 0 else 0.0,
+        "coverageDays": budget / per_day,
+        "basis": basis,
+        "sampleDays": len(days_seen),
+        "retentionDays": int(cfg.get("retentionDays") or 0),
+    }
+
+
+def coverage_text(estimate):
+    """The one sentence a person actually wants: how far back does this go."""
+    days = estimate["coverageDays"]
+    capped = estimate.get("retentionDays") or 0
+    if days < 1:
+        headline = "about %d hours" % max(1, int(round(estimate["coverageHours"])))
+    elif days < 14:
+        headline = "about %d days" % int(round(days))
+    elif days < 70:
+        headline = "about %d weeks" % int(round(days / 7.0))
+    else:
+        headline = "about %d months" % max(1, int(round(days / 30.0)))
+    if capped and days > capped:
+        return "%d days (your age limit; disk alone would reach %s)" % (
+            capped, headline)
+    return headline
+
+
+def save_config(patch):
+    """Merge into the user's config without discarding keys we did not set."""
+    ensure_dirs()
+    current = {}
+    try:
+        with open(CONFIG, "r", encoding="utf-8") as fh:
+            loaded = json.load(fh)
+        if isinstance(loaded, dict):
+            current = loaded
+    except FileNotFoundError:
+        current = dict(DEFAULTS)
+    except Exception as exc:
+        log("config unreadable (%s), rewriting from defaults" % exc)
+        current = dict(DEFAULTS)
+    current.update(patch)
+    tmp = CONFIG + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(current, fh, indent=2, sort_keys=True)
+    os.replace(tmp, CONFIG)
+    return current
+
+
+# --------------------------------------------------------------------------
+# the watch loop
+
+
+class Recorder:
+    def __init__(self):
+        self.cfg = load_config()
+        self.conn = connect()
+        self.stop = threading.Event()
+        self.jobs = queue.Queue(maxsize=OCR_QUEUE_MAX)
+        self.last_hash = None
+        self.dropped_ocr = 0
+        self.emitted = None
+        self.worker = None
+        self.coverage_cache = {}
+        self.coverage_at = 0.0
+
+    # -- OCR runs off the capture thread; a slow read must never delay a frame.
+    def ocr_worker(self):
+        conn = connect()
+        while not self.stop.is_set():
+            try:
+                job = self.jobs.get(timeout=0.5)
+            except queue.Empty:
+                # Nothing live to read, so catch up on anything that was
+                # dropped while the queue was full, or left behind by an index
+                # rebuild. The image is still on disk, so the text is not lost.
+                self.backfill(conn)
+                continue
+            if job is None:
+                break
+            frame_id, ppm, app, title = job
+            try:
+                text = ocr_text(ppm, self.cfg["ocrTimeout"])
+                attach_text(conn, frame_id, text, app, title)
+            except Exception as exc:
+                log("ocr failed for frame %s (%s)" % (frame_id, exc))
+            finally:
+                self.jobs.task_done()
+        conn.close()
+
+    def backfill(self, conn):
+        if not self.cfg.get("ocr"):
+            return
+        row = conn.execute(
+            "SELECT id,path,app,title FROM frames WHERE ocr=0"
+            " ORDER BY ts DESC LIMIT 1").fetchone()
+        if not row:
+            return
+        frame_id, path, app, title = row
+        if not os.path.exists(path):
+            # The frame was pruned out from under us; stop it being retried
+            # forever by taking the row with it.
+            drop_frames(conn, [(frame_id, path)])
+            return
+        try:
+            text = ocr_frame_file(path, self.cfg["ocrTimeout"])
+            if text is None:
+                conn.execute("UPDATE frames SET ocr=2 WHERE id=?", (frame_id,))
+                conn.commit()
+                return
+            attach_text(conn, frame_id, text, app, title)
+        except Exception as exc:
+            log("backfill failed for frame %s (%s)" % (frame_id, exc))
+
+    def queue_ocr(self, frame_id, ppm, app, title):
+        if not self.cfg.get("ocr"):
+            return
+        try:
+            self.jobs.put_nowait((frame_id, ppm, app, title))
+        except queue.Full:
+            # Better to lose the text of one frame than to fall behind the
+            # screen. The frame itself is already safely on disk.
+            self.dropped_ocr += 1
+
+    def paused(self):
+        return os.path.exists(PAUSE_MARKER)
+
+    def coverage(self):
+        """Days-of-history for the bar. Cached: the estimate walks every row,
+        which is cheap once every few minutes and silly once every 4 seconds."""
+        now = time.time()
+        if not self.coverage_cache or now - self.coverage_at > 300:
+            try:
+                estimate = capacity(self.conn, self.cfg)
+                self.coverage_cache = {
+                    # Whole days only: a float here would change on every tick
+                    # and defeat the change-only emission below.
+                    "coverageDays": int(round(estimate["coverageDays"])),
+                    "coverageText": coverage_text(estimate),
+                    "coverageBasis": estimate["basis"],
+                }
+            except sqlite3.Error as exc:
+                log("coverage estimate failed: %s" % exc)
+                self.coverage_cache = {}
+            self.coverage_at = now
+        return self.coverage_cache
+
+    def emit(self, **extra):
+        frames, total = usage(self.conn)
+        today = time.strftime("%Y-%m-%d")
+        today_count = self.conn.execute(
+            "SELECT COUNT(*) FROM frames WHERE day=?", (today,)).fetchone()[0]
+        pending = self.conn.execute(
+            "SELECT COUNT(*) FROM frames WHERE ocr=0").fetchone()[0]
+        state = {
+            "paused": self.paused(),
+            "frames": frames,
+            "today": int(today_count),
+            "bytes": total,
+            "budget": int(self.cfg["budgetMB"]) * 1024 * 1024,
+            "pendingOcr": int(pending),
+            "droppedOcr": self.dropped_ocr,
+            "ocr": bool(self.cfg.get("ocr")),
+            "interval": self.cfg["interval"],
+        }
+        state.update(self.coverage())
+        state.update(extra)
+        # Only speak when something actually changed, so an idle desktop is a
+        # silent one. Proven pattern; keeps the shell from re-rendering forever.
+        compact = json.dumps(state, sort_keys=True)
+        if compact == self.emitted:
+            return
+        self.emitted = compact
+        try:
+            with open(STATE_PATH, "w", encoding="utf-8") as fh:
+                json.dump(state, fh)
+        except OSError:
+            pass
+        sys.stdout.write(compact + "\n")
+        sys.stdout.flush()
+
+    def tick(self):
+        if self.paused():
+            self.emit(reason="paused", capturing=False)
+            return
+
+        if session_locked():
+            self.emit(reason="locked", capturing=False)
+            return
+
+        monitor, awake = focused_monitor()
+        if not awake:
+            self.emit(reason="screen off", capturing=False)
+            return
+
+        app, title = active_window()
+        rule = blocked_by(self.cfg, app, title)
+        if rule:
+            # The frame is never taken. Nothing to delete later, because
+            # nothing existed.
+            self.emit(reason="blocked", capturing=False, blockedBy=rule)
+            return
+
+        ppm, err = capture(monitor)
+        if ppm is None:
+            self.emit(reason=err or "capture failed", capturing=False)
+            return
+
+        bits = average_hash(ppm)
+        if bits is None:
+            self.emit(reason="unreadable frame", capturing=False)
+            return
+
+        if distance(bits, self.last_hash) < self.cfg["changeBits"]:
+            self.emit(reason="", capturing=True, app=app)
+            return
+
+        webp, err = encode_webp(ppm, self.cfg["quality"])
+        if webp is None:
+            self.emit(reason=err or "encode failed", capturing=False)
+            return
+
+        now = time.time()
+        _, path = frame_path(now)
+        try:
+            with open(path, "wb") as fh:
+                fh.write(webp)
+        except OSError as exc:
+            self.emit(reason="disk error: %s" % exc, capturing=False)
+            return
+
+        self.last_hash = bits
+        frame_id = store(self.conn, now, path, app, title, monitor or "",
+                         bits, len(webp))
+        self.queue_ocr(frame_id, ppm, app, title)
+        prune(self.conn, self.cfg)
+        self.emit(reason="", capturing=True, app=app, lastFrame=now)
+
+    def run(self):
+        self.worker = threading.Thread(target=self.ocr_worker, daemon=True)
+        self.worker.start()
+
+        def bye(*_):
+            self.stop.set()
+        signal.signal(signal.SIGTERM, bye)
+        signal.signal(signal.SIGINT, bye)
+
+        self.emit(reason="starting", capturing=not self.paused())
+        while not self.stop.is_set():
+            started = time.time()
+            try:
+                self.tick()
+            except sqlite3.Error as exc:
+                log("database error: %s" % exc)
+            except Exception as exc:
+                log("tick failed: %s" % exc)
+            delay = self.cfg["interval"] - (time.time() - started)
+            if delay > 0:
+                self.stop.wait(delay)
+        try:
+            self.jobs.put_nowait(None)
+        except queue.Full:
+            pass
+        return 0
+
+
+# --------------------------------------------------------------------------
+# commands
+
+
+def fts_query(term):
+    """Turn what a person typed into something FTS5 will not reject.
+
+    Users type apostrophes, hyphens and stray quotes; FTS5 treats several of
+    those as syntax and raises. Quoting each bare word keeps the search box
+    from throwing errors at people who typed a normal sentence.
+    """
+    words = re.findall(r"[\w./:@-]+", term or "", re.UNICODE)
+    # A token of pure punctuation ("---", "...") survives the split but
+    # tokenises to nothing. Measured: FTS5 quietly ignores such a phrase rather
+    # than raising, so this is about not sending noise - and about "   ---   "
+    # alone becoming an empty match instead of a query that scans everything.
+    kept = [word.replace('"', "") for word in words
+            if any(char.isalnum() for char in word)]
+    if not kept:
+        return ""
+    # Nobody types "python3" when looking for python, or "ModuleNotFoundError"
+    # when they remember "module". Anything long enough to be specific matches
+    # as a prefix; short words stay exact so "in" does not match half the day.
+    return " ".join(
+        ('"%s"*' % word) if len(word) >= 4 else ('"%s"' % word)
+        for word in kept)
+
+
+def cmd_search(args):
+    term = " ".join(args).strip()
+    conn = connect()
+    if not term:
+        print(json.dumps({"query": "", "results": []}))
+        return 0
+    match = fts_query(term)
+    if not match:
+        print(json.dumps({"query": term, "results": []}))
+        return 0
+    try:
+        rows = conn.execute("""
+            SELECT f.id, f.ts, f.app, f.title, f.path,
+                   snippet(frames_fts, 0, '‹', '›', '...', 12),
+                   LENGTH(frames_fts.text), f.hash
+            FROM frames_fts
+            JOIN frames f ON f.id = frames_fts.rowid
+            WHERE frames_fts MATCH ?
+            ORDER BY rank
+            LIMIT 240""", (match,)).fetchall()
+    except sqlite3.Error as exc:
+        print(json.dumps({"query": term, "results": [], "error": str(exc)}))
+        return 1
+    # Keep BM25's ordering, but a frame with almost no words on it is noise
+    # however well it scores: there is no context to recognise the moment by.
+    rows = [row for row in rows if (row[6] or 0) >= MIN_RESULT_CHARS] or rows
+
+    # Collapse frames that show the same moment, keeping the best-ranked one.
+    kept = []
+    seen_hashes = []
+    seen_text = []
+    for row in rows:
+        # Two frames can look different - a sidebar moved, the clock ticked -
+        # and still say the same thing where it matters, so the excerpt is
+        # checked as well as the picture.
+        excerpt = re.sub(r"[^a-z0-9]+", " ", (row[5] or "").lower()).strip()
+        # OCR rarely misreads the same screen the same way twice, so exact
+        # matching is not enough; near-identical excerpts are one moment too.
+        if excerpt and (excerpt in seen_text or any(
+                difflib.SequenceMatcher(None, excerpt, other).ratio() > 0.75
+                for other in seen_text)):
+            continue
+        try:
+            bits = int(row[7])
+        except (TypeError, ValueError):
+            bits = None
+        if bits is not None and any(
+                distance(bits, other) < RESULT_SAME_MOMENT_BITS for other in seen_hashes):
+            continue
+        if bits is not None:
+            seen_hashes.append(bits)
+        if excerpt:
+            seen_text.append(excerpt)
+        kept.append(row)
+    rows = kept
+
+    results = [{
+        "id": row[0],
+        "ts": row[1],
+        "time": time.strftime("%a %H:%M", time.localtime(row[1])),
+        "day": time.strftime("%Y-%m-%d", time.localtime(row[1])),
+        "app": row[2] or "",
+        "title": row[3] or "",
+        "path": row[4],
+        "snippet": row[5] or "",
+    } for row in rows[:60]]
+    print(json.dumps({"query": term, "results": results}))
+    return 0
+
+
+def cmd_timeline(args):
+    day = args[0] if args else time.strftime("%Y-%m-%d")
+    conn = connect()
+    rows = conn.execute(
+        "SELECT id,ts,app,title,path FROM frames WHERE day=? ORDER BY ts",
+        (day,)).fetchall()
+    print(json.dumps({"day": day, "frames": [{
+        "id": r[0],
+        "ts": r[1],
+        "time": time.strftime("%H:%M", time.localtime(r[1])),
+        "app": r[2] or "",
+        "title": r[3] or "",
+        "path": r[4],
+    } for r in rows]}))
+    return 0
+
+
+def cmd_text(args):
+    if not args:
+        log("usage: hindsight text <frame-id>")
+        return 2
+    conn = connect()
+    row = conn.execute(
+        "SELECT text FROM frames_fts WHERE rowid=?", (int(args[0]),)).fetchone()
+    sys.stdout.write((row[0] if row else "") or "")
+    return 0
+
+
+def cmd_status(_args):
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as fh:
+            state = json.load(fh)
+    except Exception:
+        state = {}
+    conn = connect()
+    frames, total = usage(conn)
+    state.setdefault("frames", frames)
+    state.setdefault("bytes", total)
+    state["paused"] = os.path.exists(PAUSE_MARKER)
+    print(json.dumps(state, sort_keys=True))
+    return 0
+
+
+def set_paused(paused):
+    ensure_dirs()
+    if paused:
+        with open(PAUSE_MARKER, "w", encoding="utf-8") as fh:
+            fh.write(str(time.time()))
+    else:
+        try:
+            os.remove(PAUSE_MARKER)
+        except FileNotFoundError:
+            pass
+    print(json.dumps({"paused": paused}))
+    return 0
+
+
+def cmd_pause(_a):
+    return set_paused(True)
+
+
+def cmd_resume(_a):
+    return set_paused(False)
+
+
+def cmd_toggle(_a):
+    return set_paused(not os.path.exists(PAUSE_MARKER))
+
+
+def cmd_prune(_args):
+    conn = connect()
+    cfg = load_config()
+    removed = prune(conn, cfg)
+    frames, total = usage(conn)
+    print(json.dumps({"removed": removed, "frames": frames, "bytes": total}))
+    return 0
+
+
+def cmd_forget(args):
+    """Delete history. 'today', a YYYY-MM-DD day, or 'all'."""
+    if not args:
+        log("usage: hindsight forget <all|today|YYYY-MM-DD>")
+        return 2
+    target = args[0]
+    conn = connect()
+    if target == "all":
+        rows = conn.execute("SELECT id,path FROM frames").fetchall()
+    else:
+        day = time.strftime("%Y-%m-%d") if target == "today" else target
+        rows = conn.execute(
+            "SELECT id,path FROM frames WHERE day=?", (day,)).fetchall()
+    removed = drop_frames(conn, rows)
+    empty_dirs()
+    print(json.dumps({"forgot": removed, "target": target}))
+    return 0
+
+
+def cmd_doctor(_args):
+    cfg = load_config()
+    report = {"ok": True, "checks": []}
+
+    def check(name, ok, detail=""):
+        report["checks"].append({"name": name, "ok": bool(ok), "detail": detail})
+        if not ok:
+            report["ok"] = False
+
+    for tool, why in (("grim", "screen capture"),
+                      ("magick", "webp encoding"),
+                      ("tesseract", "text recognition"),
+                      ("hyprctl", "active window and monitors")):
+        path = shutil.which(tool)
+        check(tool, path is not None, path or "not found (%s)" % why)
+
+    check("sqlite FTS5", fts_supported(), sqlite3.sqlite_version)
+
+    monitor, awake = focused_monitor()
+    check("focused output", monitor is not None,
+          "%s%s" % (monitor or "unknown", "" if awake else " (screen off)"))
+
+    ppm, err = capture(monitor)
+    check("capture", ppm is not None,
+          "%d bytes" % len(ppm) if ppm else err)
+    if ppm:
+        bits = average_hash(ppm)
+        check("frame hash", bits is not None,
+              "%d/%d bits set" % (bin(bits).count("1"), HASH_BITS) if bits else "unparsed")
+
+    try:
+        stat = os.statvfs(DATA if os.path.isdir(DATA) else HOME)
+        free = stat.f_bavail * stat.f_frsize
+        check("disk", free > 512 * 1024 * 1024, "%.1f GB free" % (free / 1e9))
+    except OSError as exc:
+        check("disk", False, str(exc))
+
+    conn = connect()
+    frames, total = usage(conn)
+    report["frames"] = frames
+    report["bytes"] = total
+    report["budgetBytes"] = int(cfg["budgetMB"]) * 1024 * 1024
+    report["paused"] = os.path.exists(PAUSE_MARKER)
+    report["data"] = DATA
+    report["config"] = CONFIG
+    report["network"] = "never"
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0 if report["ok"] else 1
+
+
+def human_bytes(count):
+    count = float(count or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if count < 1024 or unit == "GB":
+            return "%.0f %s" % (count, unit) if unit == "B" else "%.1f %s" % (count, unit)
+        count /= 1024.0
+
+
+def human_mb(megabytes):
+    if megabytes >= 1024 and megabytes % 1024 == 0:
+        return "%d GB" % (megabytes // 1024)
+    if megabytes >= 1024:
+        return "%.1f GB" % (megabytes / 1024.0)
+    return "%d MB" % megabytes
+
+
+def cmd_budget(args):
+    """Show, or set, how much disk the archive may use - in days, not bytes."""
+    cfg = load_config()
+    as_json = "--json" in args
+    wanted = [a for a in args if not a.startswith("-")]
+
+    if wanted:
+        megabytes = parse_size_mb(wanted[0])
+        if megabytes is None:
+            log("unreadable size: %s (try 8G, 512M or 4096)" % wanted[0])
+            return 2
+        cfg = load_config()
+        cfg["budgetMB"] = max(64, megabytes)
+        save_config({"budgetMB": cfg["budgetMB"]})
+        conn = connect()
+        freed = prune(conn, cfg)
+        if freed:
+            log("budget lowered; dropped %d frame(s) to fit" % freed)
+    else:
+        conn = connect()
+
+    estimate = capacity(conn, cfg)
+    if as_json:
+        # A budget set by hand from the CLI still gets a chip of its own,
+        # otherwise the panel would show nothing as selected.
+        choices = sorted(set(BUDGET_CHOICES_MB) | {estimate["budgetMB"]})
+        estimate["options"] = [
+            {"mb": mb, "label": human_mb(mb),
+             "text": coverage_text(capacity(conn, cfg, mb))}
+            for mb in choices
+        ]
+        estimate["text"] = coverage_text(estimate)
+        print(json.dumps(estimate, sort_keys=True))
+        return 0
+
+    note = {
+        "measured": "from %d full days of your own history" % estimate["sampleDays"],
+        "sampled": "from your history so far, assuming an %d-hour day"
+                   % int(ASSUMED_ACTIVE_HOURS),
+        "default": "estimate only - not enough history yet",
+    }[estimate["basis"]]
+    print("budget    %s (%s used, %d frames)" % (
+        human_mb(estimate["budgetMB"]), human_bytes(estimate["usedBytes"]),
+        estimate["frames"]))
+    print("reaches   %s  (%s)" % (coverage_text(estimate), note))
+    print("rate      %s per active hour" % human_bytes(estimate["bytesPerActiveHour"]))
+    print("")
+    for mb in BUDGET_CHOICES_MB:
+        mark = "->" if mb == estimate["budgetMB"] else "  "
+        print("%s %-8s %s" % (mark, human_mb(mb),
+                              coverage_text(capacity(conn, cfg, mb))))
+    print("")
+    print("set with: hindsight budget 8G")
+    return 0
+
+
+def cmd_config(_args):
+    ensure_dirs()
+    if not os.path.exists(CONFIG):
+        with open(CONFIG, "w", encoding="utf-8") as fh:
+            json.dump(DEFAULTS, fh, indent=2, sort_keys=True)
+    print(CONFIG)
+    return 0
+
+
+def cmd_watch(_args):
+    if not fts_supported():
+        log("this python's sqlite has no FTS5; search will not work")
+    return Recorder().run()
+
+
+COMMANDS = {
+    "watch": cmd_watch,
+    "search": cmd_search,
+    "timeline": cmd_timeline,
+    "text": cmd_text,
+    "status": cmd_status,
+    "pause": cmd_pause,
+    "resume": cmd_resume,
+    "toggle": cmd_toggle,
+    "prune": cmd_prune,
+    "forget": cmd_forget,
+    "doctor": cmd_doctor,
+    "budget": cmd_budget,
+    "config": cmd_config,
+}
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
+        sys.stdout.write(
+            "hindsight - a local, searchable memory of your screen\n\n"
+            "  watch                 run the recorder (used by the bar)\n"
+            "  search <words>        full-text search across captured screens\n"
+            "  timeline [day]        frames for a day, oldest first\n"
+            "  text <id>             the recognised text of one frame\n"
+            "  status                current recorder state\n"
+            "  pause | resume | toggle\n"
+            "  prune                 enforce the size and age budget now\n"
+            "  budget [size]         show, or set, disk budget as days of history\n"
+            "  forget <all|today|YYYY-MM-DD>\n"
+            "  doctor                check dependencies and capture\n"
+            "  config                print (creating if needed) the config path\n")
+        return 0
+    handler = COMMANDS.get(argv[1])
+    if not handler:
+        log("unknown command: %s" % argv[1])
+        return 2
+    try:
+        return handler(argv[2:])
+    except BrokenPipeError:
+        return 0
+    except KeyboardInterrupt:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

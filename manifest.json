@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "dhirajkhanna.hindsight",
+  "name": "Hindsight",
+  "version": "0.1.0",
+  "author": "Dhiraj Khanna",
+  "license": "MIT",
+  "description": "A local, searchable memory of your screen. Search the words you saw an hour ago and jump back to the moment you saw them.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Hindsight",
+    "description": "Search everything your screen has shown you, and scrub back through the day.",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
