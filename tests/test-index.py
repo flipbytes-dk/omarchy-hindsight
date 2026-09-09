@@ -357,6 +357,64 @@ found = _json.loads(buf.getvalue())["results"]
 check("three readings of one screen collapse to one row",
       len(found) == 2, [r["snippet"][:40] for r in found])
 
+print("\n-- a screen history must not be readable by other local users --")
+import stat as statmod
+
+def mode_of(path):
+    return os.stat(path).st_mode & 0o777
+
+# Simulate what a lax umask produced before this was enforced.
+os.umask(0o022)
+hs.ensure_dirs()
+loose_dir = os.path.join(hs.FRAMES, "2020-01-01")
+os.makedirs(loose_dir, exist_ok=True)
+os.chmod(loose_dir, 0o755)
+loose_file = os.path.join(loose_dir, "leak.webp")
+open(loose_file, "wb").write(b"pretend frame")
+os.chmod(loose_file, 0o644)
+os.chmod(hs.DATA, 0o755)
+check("the test really did create a world-readable frame",
+      mode_of(loose_file) == 0o644 and mode_of(hs.DATA) == 0o755)
+
+fixed = hs.harden_all()
+check("startup repair tightens an archive an older version left open",
+      fixed > 0, fixed)
+check("the data directory becomes private", mode_of(hs.DATA) == 0o700,
+      oct(mode_of(hs.DATA)))
+check("a day directory becomes private", mode_of(loose_dir) == 0o700,
+      oct(mode_of(loose_dir)))
+check("an existing frame becomes private", mode_of(loose_file) == 0o600,
+      oct(mode_of(loose_file)))
+
+os.umask(0o077)
+hs.ensure_dirs()
+check("new directories are created private", mode_of(hs.FRAMES) == 0o700,
+      oct(mode_of(hs.FRAMES)))
+
+hs.save_config({"budgetMB": 1024})
+check("the config file is private", mode_of(hs.CONFIG) == 0o600,
+      oct(mode_of(hs.CONFIG)))
+check("no config temp file is left behind",
+      not os.path.exists(hs.CONFIG + ".tmp"))
+
+perms = hs.connect()
+for suffix in ("", "-wal"):
+    target = hs.DB_PATH + suffix
+    if os.path.exists(target):
+        check("the index (%s) is private" % (suffix or "db"),
+              mode_of(target) == 0o600, oct(mode_of(target)))
+
+hs.set_paused(True)
+check("the pause marker is private", mode_of(hs.PAUSE_MARKER) == 0o600,
+      oct(mode_of(hs.PAUSE_MARKER)))
+hs.set_paused(False)
+
+check("nothing under the data directory is group or world readable",
+      not [os.path.join(b, n)
+           for b, ds, fs in os.walk(hs.DATA)
+           for n in list(ds) + list(fs)
+           if os.stat(os.path.join(b, n)).st_mode & 0o077])
+
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 if FAIL:
     print("failed: " + ", ".join(FAIL))

@@ -128,6 +128,10 @@ This plugin exists to remember your screen, so it is built to be told no.
 - **Locked and asleep screens are skipped**, as is a monitor whose DPMS is off,
   and so is the screensaver: idle time is not a memory worth keeping.
 - **Forget.** `bin/hindsight forget today`, a specific day, or `all`.
+- **No other user can read it.** Every directory is `0700` and every file
+  `0600` - frames, the index and its WAL, config, state. The recorder also
+  repairs anything an earlier version left loose when it starts, and
+  `bin/hindsight doctor` reports the state of it.
 - **No network.** There is no code here that opens a socket.
 
 ## Commands

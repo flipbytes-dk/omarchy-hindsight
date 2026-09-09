@@ -58,6 +58,13 @@ DEFAULTS = {
     "captureOnBattery": True,
 }
 
+# A record of everything that has been on screen is the most private thing on
+# the machine. Nothing here may be readable by another local user, so every
+# directory is 0700 and every file 0600 - enforced by umask for anything new
+# and repaired on startup for anything an earlier version already wrote.
+DIR_MODE = 0o700
+FILE_MODE = 0o600
+
 HASH_N = 32          # 32x32 grid -> 1024-bit average hash
 HASH_BITS = HASH_N * HASH_N
 MIN_RESULT_CHARS = 60  # below this a frame carries no context worth showing
@@ -96,18 +103,60 @@ def log(message):
     sys.stderr.flush()
 
 
+def secure(path, mode):
+    """Force a private mode, ignoring anything already gone (a pruned frame)."""
+    try:
+        if (os.stat(path).st_mode & 0o777) != mode:
+            os.chmod(path, mode)
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def harden_tree(root):
+    """Repair permissions written by an earlier, more careless version."""
+    fixed = 0
+    if not os.path.isdir(root):
+        return 0
+    fixed += 1 if secure(root, DIR_MODE) else 0
+    for base, dirs, files in os.walk(root):
+        for name in dirs:
+            fixed += 1 if secure(os.path.join(base, name), DIR_MODE) else 0
+        for name in files:
+            fixed += 1 if secure(os.path.join(base, name), FILE_MODE) else 0
+    return fixed
+
+
+def harden_all():
+    fixed = harden_tree(DATA) + harden_tree(os.path.dirname(CONFIG))
+    if fixed:
+        log("tightened permissions on %d existing path(s)" % fixed)
+    return fixed
+
+
 def ensure_dirs():
-    os.makedirs(FRAMES, exist_ok=True)
-    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    os.makedirs(FRAMES, mode=DIR_MODE, exist_ok=True)
+    os.makedirs(os.path.dirname(CONFIG), mode=DIR_MODE, exist_ok=True)
+    # makedirs only applies the mode to the leaf it creates, so the parents
+    # and any directory that already existed are set explicitly.
+    for path in (DATA, FRAMES, os.path.dirname(CONFIG)):
+        secure(path, DIR_MODE)
 
 
 # --------------------------------------------------------------------------
 # database
 
 
+def secure_db_files():
+    for suffix in ("", "-wal", "-shm"):
+        secure(DB_PATH + suffix, FILE_MODE)
+
+
 def connect():
     ensure_dirs()
     conn = sqlite3.connect(DB_PATH, timeout=15)
+    secure_db_files()
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("""
@@ -357,7 +406,8 @@ def frame_path(ts):
     day = time.strftime("%Y-%m-%d", time.localtime(ts))
     name = time.strftime("%H%M%S", time.localtime(ts))
     directory = os.path.join(FRAMES, day)
-    os.makedirs(directory, exist_ok=True)
+    os.makedirs(directory, mode=DIR_MODE, exist_ok=True)
+    secure(directory, DIR_MODE)
     return day, os.path.join(directory, "%s-%03d.webp" % (name, int(ts * 1000) % 1000))
 
 
@@ -622,7 +672,9 @@ def save_config(patch):
     tmp = CONFIG + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(current, fh, indent=2, sort_keys=True)
+    secure(tmp, FILE_MODE)
     os.replace(tmp, CONFIG)
+    secure(CONFIG, FILE_MODE)
     return current
 
 
@@ -634,6 +686,7 @@ class Recorder:
     def __init__(self):
         self.cfg = load_config()
         self.conn = connect()
+        harden_all()
         self.stop = threading.Event()
         self.jobs = queue.Queue(maxsize=OCR_QUEUE_MAX)
         self.last_hash = None
@@ -753,6 +806,7 @@ class Recorder:
         try:
             with open(STATE_PATH, "w", encoding="utf-8") as fh:
                 json.dump(state, fh)
+            secure(STATE_PATH, FILE_MODE)
         except OSError:
             pass
         sys.stdout.write(compact + "\n")
@@ -804,6 +858,7 @@ class Recorder:
         try:
             with open(path, "wb") as fh:
                 fh.write(webp)
+            secure(path, FILE_MODE)
         except OSError as exc:
             self.emit(reason="disk error: %s" % exc, capturing=False)
             return
@@ -989,6 +1044,7 @@ def set_paused(paused):
     if paused:
         with open(PAUSE_MARKER, "w", encoding="utf-8") as fh:
             fh.write(str(time.time()))
+        secure(PAUSE_MARKER, FILE_MODE)
     else:
         try:
             os.remove(PAUSE_MARKER)
@@ -1067,6 +1123,22 @@ def cmd_doctor(_args):
         bits = average_hash(ppm)
         check("frame hash", bits is not None,
               "%d/%d bits set" % (bin(bits).count("1"), HASH_BITS) if bits else "unparsed")
+
+    exposed = []
+    for root in (DATA, os.path.dirname(CONFIG)):
+        for base, dirs, files in os.walk(root):
+            for name in list(dirs) + list(files):
+                target = os.path.join(base, name)
+                try:
+                    if os.stat(target).st_mode & 0o077:
+                        exposed.append(target)
+                except OSError:
+                    pass
+            if len(exposed) > 5:
+                break
+    check("permissions", not exposed,
+          "%d path(s) readable by other users, e.g. %s"
+          % (len(exposed), exposed[0]) if exposed else "private to you")
 
     try:
         stat = os.statvfs(DATA if os.path.isdir(DATA) else HOME)
@@ -1165,6 +1237,7 @@ def cmd_config(_args):
     if not os.path.exists(CONFIG):
         with open(CONFIG, "w", encoding="utf-8") as fh:
             json.dump(DEFAULTS, fh, indent=2, sort_keys=True)
+        secure(CONFIG, FILE_MODE)
     print(CONFIG)
     return 0
 
@@ -1193,6 +1266,10 @@ COMMANDS = {
 
 
 def main(argv):
+    # Belt and braces: umask makes every new file and directory private no
+    # matter which code path creates it, including SQLite's own db/wal/shm.
+    os.umask(0o077)
+
     if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
         sys.stdout.write(
             "hindsight - a local, searchable memory of your screen\n\n"
