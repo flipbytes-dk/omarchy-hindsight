@@ -415,6 +415,78 @@ check("nothing under the data directory is group or world readable",
            for n in list(ds) + list(fs)
            if os.stat(os.path.join(b, n)).st_mode & 0o077])
 
+print("\n-- a probe that cannot answer must stop the capture, not allow it --")
+real_run = hs.run
+
+def with_run(fake, call):
+    hs.run = fake
+    try:
+        return call()
+    finally:
+        hs.run = real_run
+
+dead = lambda *a, **k: (1, b"", b"boom")
+timeout = lambda *a, **k: (124, b"", b"timeout")
+garbage = lambda *a, **k: (0, b"<html>not json</html>", b"")
+
+check("a failed window probe reports failure, not an empty window",
+      with_run(dead, hs.active_window)[0] is False)
+check("a timed-out window probe reports failure",
+      with_run(timeout, hs.active_window)[0] is False)
+check("unparseable window output reports failure",
+      with_run(garbage, hs.active_window)[0] is False)
+check("a failed monitor probe does not claim the screen is awake",
+      with_run(dead, hs.focused_monitor) == (False, None, False),
+      with_run(dead, hs.focused_monitor))
+# pgrep exits 1 for "ran fine, found nothing", which is an answer rather than
+# a failure, so the unknown case needs a code that means the probe broke.
+broken = lambda *a, **k: (2, b"", b"error")
+check("an unanswerable lock probe is unknown, not unlocked",
+      with_run(broken, hs.session_locked) is None,
+      with_run(broken, hs.session_locked))
+check("a missing pgrep does not crash the recorder",
+      with_run(lambda *a, **k: (127, b"", b"missing"), hs.session_locked) is None)
+
+def answered_no(cmd, **kwargs):
+    if cmd[0] == "pgrep":
+        return 1, b"", b""          # no locker running: a real answer
+    return 2, b"", b"loginctl gone"
+check("a locker that is definitely absent counts as unlocked",
+      with_run(answered_no, hs.session_locked) is False,
+      with_run(answered_no, hs.session_locked))
+
+def says_locked(cmd, **kwargs):
+    if cmd[0] == "pgrep":
+        return 1, b"", b""
+    return 0, b"yes", b""
+check("loginctl reporting a locked session is believed",
+      with_run(says_locked, hs.session_locked) is True)
+
+# The gate itself: a recorder whose probes all fail must not reach capture.
+captured = []
+real_capture = hs.capture
+hs.capture = lambda monitor: (captured.append(monitor), (None, "should not run"))[1]
+
+gate = hs.Recorder.__new__(hs.Recorder)
+gate.cfg = dict(hs.DEFAULTS)
+gate.conn = hs.connect()
+gate.emitted = None
+gate.dropped_ocr = 0
+gate.last_hash = None
+gate.coverage_cache = {"coverageDays": 0, "coverageText": "", "coverageBasis": "default"}
+gate.coverage_at = time.time()
+before = hs.usage(gate.conn)[0]
+
+for name, fake in (("lock", dead), ("display", dead), ("window", dead)):
+    hs.run = fake
+    try:
+        gate.tick()
+    finally:
+        hs.run = real_run
+check("a recorder with failing probes never calls capture", not captured, captured)
+check("and stores no frame", hs.usage(gate.conn)[0] == before)
+hs.capture = real_capture
+
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 if FAIL:
     print("failed: " + ", ".join(FAIL))

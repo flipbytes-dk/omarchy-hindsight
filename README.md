@@ -127,6 +127,11 @@ This plugin exists to remember your screen, so it is built to be told no.
   while paused. It is never ambiguous about what it is doing.
 - **Locked and asleep screens are skipped**, as is a monitor whose DPMS is off,
   and so is the screensaver: idle time is not a memory worth keeping.
+- **Every check fails closed.** If the compositor cannot say which window is
+  focused, or whether the session is locked, or whether the screen is on, the
+  frame is not taken. A blocklist is worth no more than the probe behind it,
+  so a timed-out `hyprctl` costs you a gap in the archive rather than a
+  recorded password.
 - **Forget.** `bin/hindsight forget today`, a specific day, or `all`.
 - **No other user can read it.** Every directory is `0700` and every file
   `0600` - frames, the index and its WAL, config, state. The recorder also

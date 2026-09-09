@@ -295,29 +295,40 @@ def run(cmd, timeout=5, stdin_bytes=None):
 
 
 def active_window():
+    """(probed, app, title).
+
+    `probed` False means the compositor did not answer, or answered with
+    something this cannot read. The blocklist is only as trustworthy as this
+    probe, so a caller that cannot identify the focused window must not
+    capture: a timed-out hyprctl while a password manager is focused would
+    otherwise match no rule and archive the frame."""
     code, out, _ = run(["hyprctl", "activewindow", "-j"], timeout=3)
     if code != 0:
-        return "", ""
+        return False, "", ""
+    raw = out.decode("utf-8", "replace").strip()
+    if not raw:
+        return False, "", ""
     try:
-        data = json.loads(out.decode("utf-8", "replace") or "{}")
+        data = json.loads(raw)
     except Exception:
-        return "", ""
+        return False, "", ""
     if not isinstance(data, dict):
-        return "", ""
-    return str(data.get("class") or ""), str(data.get("title") or "")
+        return False, "", ""
+    return True, str(data.get("class") or ""), str(data.get("title") or "")
 
 
 def focused_monitor():
-    """Name of the focused output, and whether its screen is actually on."""
+    """(probed, name, awake). An unanswered probe reports not-awake, so an
+    indeterminate display state stops the capture rather than allowing it."""
     code, out, _ = run(["hyprctl", "monitors", "-j"], timeout=3)
     if code != 0:
-        return None, True
+        return False, None, False
     try:
         monitors = json.loads(out.decode("utf-8", "replace") or "[]")
     except Exception:
-        return None, True
+        return False, None, False
     if not isinstance(monitors, list) or not monitors:
-        return None, True
+        return False, None, False
     chosen = None
     for mon in monitors:
         if isinstance(mon, dict) and mon.get("focused"):
@@ -328,18 +339,31 @@ def focused_monitor():
     # dpmsStatus False means the panel is asleep; grim would hand back a stale
     # or black frame and we would archive darkness.
     awake = chosen.get("dpmsStatus", True) is not False
-    return str(chosen.get("name") or "") or None, awake
+    return True, str(chosen.get("name") or "") or None, awake
 
 
 def session_locked():
-    if subprocess.run(["pgrep", "-x", "hyprlock"],
-                      capture_output=True).returncode == 0:
+    """True, False, or None when neither probe could answer.
+
+    None is not the same as unlocked. An unanswered question about whether
+    the screen is locked is not permission to record it."""
+    answered = False
+    # run() rather than subprocess.run(): a missing pgrep used to raise here
+    # and take the recorder down with it.
+    code, _, _ = run(["pgrep", "-x", "hyprlock"], timeout=3)
+    if code == 0:
         return True
+    if code == 1:
+        answered = True     # pgrep ran and found no locker
     code, out, _ = run(["loginctl", "show-session", "self",
                         "-p", "LockedHint", "--value"], timeout=3)
-    if code == 0 and out.decode("utf-8", "replace").strip() == "yes":
-        return True
-    return False
+    if code == 0:
+        hint = out.decode("utf-8", "replace").strip()
+        if hint == "yes":
+            return True
+        if hint == "no":
+            return False
+    return False if answered else None
 
 
 def blocked_by(cfg, app, title):
@@ -817,16 +841,29 @@ class Recorder:
             self.emit(reason="paused", capturing=False)
             return
 
-        if session_locked():
+        # Every gate below fails closed. If a probe cannot answer, the frame
+        # is not taken: the cost of a missed frame is a gap in the archive,
+        # and the cost of a wrong answer is a recorded password.
+        locked = session_locked()
+        if locked is None:
+            self.emit(reason="lock state unknown", capturing=False)
+            return
+        if locked:
             self.emit(reason="locked", capturing=False)
             return
 
-        monitor, awake = focused_monitor()
+        probed, monitor, awake = focused_monitor()
+        if not probed:
+            self.emit(reason="display state unknown", capturing=False)
+            return
         if not awake:
             self.emit(reason="screen off", capturing=False)
             return
 
-        app, title = active_window()
+        probed, app, title = active_window()
+        if not probed:
+            self.emit(reason="focused window unknown", capturing=False)
+            return
         rule = blocked_by(self.cfg, app, title)
         if rule:
             # The frame is never taken. Nothing to delete later, because
@@ -1112,7 +1149,7 @@ def cmd_doctor(_args):
 
     check("sqlite FTS5", fts_supported(), sqlite3.sqlite_version)
 
-    monitor, awake = focused_monitor()
+    _, monitor, awake = focused_monitor()
     check("focused output", monitor is not None,
           "%s%s" % (monitor or "unknown", "" if awake else " (screen off)"))
 
