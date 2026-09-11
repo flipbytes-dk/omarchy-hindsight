@@ -195,15 +195,30 @@ Item {
   Process {
     id: pauser
     running: false
+    property bool answered: false
+
     stdout: StdioCollector {
       onStreamFinished: {
         try {
           var data = JSON.parse(String(this.text))
-          if (data.paused !== undefined) root.paused = data.paused === true
+          if (data.paused !== undefined) {
+            root.paused = data.paused === true
+            pauser.answered = true
+          }
         } catch (e) {
-          // The next state line from the recorder will correct us.
+          // Left to onExited: this is the privacy control, so a pause that
+          // said nothing must not pass silently.
         }
       }
+    }
+
+    // The helper exits non-zero when the marker could not be written, and it
+    // can die before printing anything at all. Either way the user pressed
+    // pause and needs to know it did not take.
+    onExited: function (exitCode) {
+      if (exitCode !== 0 || !pauser.answered)
+        console.warn("hindsight: pause/resume did not take (exit " + exitCode + ")")
+      pauser.answered = false
     }
   }
 

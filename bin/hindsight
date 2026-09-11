@@ -62,8 +62,8 @@ DEFAULTS = {
     # toast, so the daemons are named directly: a frame is skipped while any
     # notification is on screen, because the code in it is not ours to judge.
     "blocklistLayers": [
-        "mako", "swaync", "dunst", "fnott", "notifications",
-        "wlogout", "rofi", "fuzzel", "wofi", "anyrun",
+        "mako", "swaync", "dunst", "fnott", "swaylock", "hyprlock",
+        "wlogout", "rofi", "fuzzel", "wofi", "anyrun", "tofi",
     ],
     "blocklistTitles": [],
 }
@@ -881,8 +881,11 @@ def visible_layers(monitor_name):
     code, out, _ = run(["hyprctl", "layers", "-j"], timeout=3)
     if code != 0:
         return False, []
+    body = out.decode("utf-8", "replace").strip()
+    if not body:
+        return False, []
     try:
-        data = json.loads(out.decode("utf-8", "replace") or "{}")
+        data = json.loads(body)
     except Exception:
         return False, []
     if not isinstance(data, dict):
@@ -904,7 +907,19 @@ def visible_layers(monitor_name):
             for surface in surfaces:
                 if not isinstance(surface, dict):
                     return False, []
-                names.append(str(surface.get("namespace") or ""))
+                namespace = surface.get("namespace")
+                if namespace is None:
+                    # A surface we cannot name is a surface we cannot clear.
+                    return False, []
+                # A daemon may keep a surface mapped at zero size or fully
+                # transparent between notifications. Blocking on those stops
+                # the recorder for as long as the daemon runs, rather than
+                # for as long as something is on screen.
+                if surface.get("w") == 0 or surface.get("h") == 0:
+                    continue
+                if surface.get("alpha") == 0:
+                    continue
+                names.append(str(namespace))
     if not found:
         # The same shape visible_windows() fails closed on. An output that is
         # not in the layers map is an output we know nothing about.
@@ -962,7 +977,13 @@ def blocked_layer(cfg, namespaces):
         hay = str(namespace or "").lower()
         for needle in rules:
             token = str(needle).lower().strip()
-            if token and token in hay:
+            if not token:
+                continue
+            # Anchored, not "contains": swaync's own surfaces are named
+            # swaync-control-center and should match, but a status bar called
+            # eww-notifications-bar is not a notification daemon and blocking
+            # it would stop the recorder for good.
+            if hay == token or hay.startswith(token + "-"):
                 return str(needle)
     return ""
 
@@ -1177,7 +1198,7 @@ def prune(conn, cfg):
     # The index counts too, but it must never eat the whole budget: leave at
     # least half for frames so a fat index cannot prune the archive to nothing.
     room = max(budget // 2, budget - index_bytes())
-    total = usage(conn)[1]
+    total = archive_total(usage(conn)[1])
     budget = room
     if total > budget:
         # Materialise the candidates first: deleting rows from under a live
@@ -1213,6 +1234,7 @@ def prune(conn, cfg):
         removed += drop_frames(conn, doomed)
     if removed:
         empty_dirs()
+        _archive_measure["at"] = 0.0
     return removed
 
 
@@ -1236,6 +1258,71 @@ def empty_dirs():
                 os.rmdir(path)
         except OSError:
             continue
+
+
+ARCHIVE_MEASURE_INTERVAL = 300.0
+_archive_measure = {"bytes": None, "at": 0.0}
+
+
+def measure_archive(depth=0, fd=None):
+    """Total bytes of real frames on disk, counted without trusting the index.
+
+    The index is a file the user's account can edit, and the previous repair
+    only ran once the column claimed the archive was over budget - so setting
+    every size to zero turned the disk budget off completely and the repair
+    could never see it. This asks the filesystem instead."""
+    own = fd is None
+    if own:
+        fd = open_archive()
+        if fd is None:
+            return None
+    total = 0
+    try:
+        for entry in os.scandir(fd):
+            try:
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    if depth >= MAX_ARCHIVE_DEPTH:
+                        continue
+                    child = os.open(entry.name,
+                                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                    dir_fd=fd)
+                    try:
+                        nested = measure_archive(depth + 1, child)
+                        total += nested or 0
+                    finally:
+                        os.close(child)
+                elif entry.is_file(follow_symlinks=False):
+                    total += min(entry.stat(follow_symlinks=False).st_size,
+                                 MAX_FRAME_BYTES)
+            except OSError:
+                continue
+    except OSError:
+        return None
+    finally:
+        if own:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    return total
+
+
+def archive_total(column_total):
+    """The larger of what the index claims and what the disk actually holds.
+
+    Re-measured on a timer as well as whenever the column looks over budget,
+    so neither inflating nor deflating the column can steer pruning."""
+    now = time.time()
+    stale = now - _archive_measure["at"] > ARCHIVE_MEASURE_INTERVAL
+    if stale or _archive_measure["bytes"] is None:
+        measured = measure_archive()
+        if measured is not None:
+            _archive_measure["bytes"] = measured
+            _archive_measure["at"] = now
+    measured = _archive_measure["bytes"]
+    return column_total if measured is None else max(column_total, measured)
 
 
 def disk_size(path, recorded):

@@ -141,7 +141,8 @@ This plugin exists to remember your screen, so it is built to be told no.
   drawn as layer surfaces rather than windows, and `blocklistLayers` matches
   them by the name of the program that drew them, because a notification
   carries the daemon's name and not the name of whatever raised it. A frame
-  is skipped while a notification is on screen.
+  is skipped while such a surface is actually drawn; one kept mapped at zero
+  size or fully transparent between notifications does not stop recording.
 - **Every check fails closed.** If the compositor cannot say which window is
   focused, or whether the session is locked, or whether the screen is on, the
   frame is not taken. A blocklist is worth no more than the probe behind it,
@@ -172,7 +173,10 @@ hindsight config                print (creating if needed) the config path
 
 ## Configuration
 
-`~/.config/omarchy-hindsight/config.json`:
+`~/.config/omarchy-hindsight/config.json`. Both block lists are shown here in
+full, because writing one replaces the defaults rather than adding to them:
+drop an entry and you lose that protection. Setting a list to `[]` disables it
+entirely; removing the key restores the defaults.
 
 ```json
 {
@@ -182,8 +186,12 @@ hindsight config                print (creating if needed) the config path
   "quality": 60,
   "changeBits": 12,
   "ocr": true,
-  "blocklist": ["1password", "bitwarden", "keepassxc", "incognito", "private browsing"],
-  "blocklistLayers": ["mako", "swaync", "dunst", "rofi", "fuzzel", "wlogout"],
+  "blocklist": ["1password", "bitwarden", "keepassxc", "keepass",
+                "gnome-keyring", "seahorse", "private browsing", "incognito",
+                "inprivate", "screensaver", "org.omarchy.screensaver"],
+  "blocklistLayers": ["mako", "swaync", "dunst", "fnott", "swaylock",
+                      "hyprlock", "wlogout", "rofi", "fuzzel", "wofi",
+                      "anyrun", "tofi"],
   "blocklistTitles": []
 }
 ```
@@ -200,7 +208,7 @@ Frames and the index live in `~/.local/share/omarchy-hindsight/`.
 python3 tests/test-index.py
 ```
 
-156 offline checks covering the hashing, the blocklist, query sanitising, the
+169 offline checks covering the hashing, the blocklist, query sanitising, the
 search round trip, ring-buffer pruning, age retention, index migration, and the
 frame-vanished-under-the-backfill case — none of which need a screen.
 

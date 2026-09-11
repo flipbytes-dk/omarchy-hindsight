@@ -896,12 +896,128 @@ sidecar = hs.connect()
 sidecar.execute("CREATE TABLE IF NOT EXISTS touch(x)")
 sidecar.execute("INSERT INTO touch VALUES(1)")
 sidecar.commit()
+# Under the suite's 0o077 umask SQLite would create these privately anyway,
+# so the reordering of secure_db_files() is only actually tested at 0o000.
+_umask_was = os.umask(0o000)
+try:
+    for _suffix in ("", "-wal", "-shm"):
+        try:
+            os.chmod(hs.DB_PATH + _suffix, 0o644)
+        except OSError:
+            pass
+    hs.connect().execute("CREATE TABLE IF NOT EXISTS touch2(x)")
+finally:
+    os.umask(_umask_was)
 present = [s for s in ("", "-wal", "-shm") if os.path.exists(hs.DB_PATH + s)]
 check("the WAL exists to be checked at all", "-wal" in present, present)
 for suffix in present:
     check("the index%s is private" % (suffix or ""),
           (os.stat(hs.DB_PATH + suffix).st_mode & 0o777) == 0o600,
           oct(os.stat(hs.DB_PATH + suffix).st_mode & 0o777))
+
+print("\n-- the budget must survive a column edited in either direction --")
+both = hs.connect()
+bday = os.path.join(hs.FRAMES, "2017-04-04")
+os.makedirs(bday, exist_ok=True)
+for i in range(40):
+    fp = os.path.join(bday, "%06d-000.webp" % i)
+    open(fp, "wb").write(b"b" * 200 * 1024)
+    hs.store(both, 200 + i, fp, "app", "t", "DP-1", i, 200 * 1024)
+tight_cfg = dict(hs.DEFAULTS)
+tight_cfg["budgetMB"] = 4
+tight_cfg["retentionDays"] = 0
+
+both.execute("UPDATE frames SET bytes=0")
+both.commit()
+hs._archive_measure.update({"bytes": None, "at": 0.0})
+check("a column edited down to zero does not switch the budget off",
+      hs.measure_archive() > 4 * 1024 * 1024, hs.measure_archive())
+removed_down = hs.prune(both, tight_cfg)
+check("and pruning still happens", removed_down > 0, removed_down)
+
+both.execute("UPDATE frames SET bytes=NULL")
+both.commit()
+hs._archive_measure.update({"bytes": None, "at": 0.0})
+check("a NULL column is handled the same way",
+      hs.archive_total(hs.usage(both)[1]) > 0)
+
+# convergence, measured rather than assumed
+calls = {"n": 0}
+real_descend = hs.archive_descend
+def counted(path):
+    calls["n"] += 1
+    return real_descend(path)
+hs.archive_descend = counted
+try:
+    roomy = dict(hs.DEFAULTS); roomy["budgetMB"] = 4096; roomy["retentionDays"] = 0
+    hs._archive_measure.update({"bytes": None, "at": 0.0})
+    hs.prune(both, roomy)
+    first_pass = calls["n"]
+    calls["n"] = 0
+    hs.prune(both, roomy)
+    second_pass = calls["n"]
+finally:
+    hs.archive_descend = real_descend
+check("prune converges instead of re-walking the archive every tick",
+      second_pass == 0, "first %d calls, second %d" % (first_pass, second_pass))
+
+print("\n-- overlays: drawn ones block, mapped-but-invisible ones do not --")
+def layer_map(surfaces):
+    def fake(cmd, **kwargs):
+        if cmd[:2] == ["hyprctl", "layers"]:
+            return 0, json.dumps({"DP-1": {"levels": {"2": surfaces}}}).encode(), b""
+        return 1, b"", b""
+    return fake
+
+drawn = [{"namespace": "swaync-control-center", "w": 400, "h": 300, "alpha": 1}]
+hidden = [{"namespace": "swaync-control-center", "w": 0, "h": 0, "alpha": 0}]
+check("a drawn notification surface is seen",
+      with_run(layer_map(drawn), lambda: hs.visible_layers("DP-1"))[1] ==
+      ["swaync-control-center"])
+check("one kept mapped at zero size is not",
+      with_run(layer_map(hidden), lambda: hs.visible_layers("DP-1")) == (True, []))
+check("a surface with no namespace is unreadable, not harmless",
+      with_run(layer_map([{"w": 10, "h": 10}]),
+               lambda: hs.visible_layers("DP-1")) == (False, []))
+check("a widget merely containing a rule word is not blocked",
+      hs.blocked_layer(hs.DEFAULTS, ["eww-notifications-bar"]) == "")
+check("but the daemon's own surfaces are",
+      hs.blocked_layer(hs.DEFAULTS, ["swaync-control-center"]) == "swaync")
+check("an empty answer from hyprctl is not an empty screen",
+      with_run(lambda *a, **k: (0, b"   ", b""),
+               lambda: hs.visible_layers("DP-1")) == (False, []))
+check("an explicit empty list disables layer blocking",
+      hs.blocked_layer({"blocklistLayers": []}, ["mako"]) == "")
+check("and an absent key restores the defaults",
+      hs.blocked_layer({}, ["mako"]) == "mako")
+
+# the whole gate, with an overlay rather than a window
+overlay_seen = []
+real_capture2 = hs.capture
+hs.capture = lambda m: (overlay_seen.append(m), (None, "must not run"))[1]
+g3 = hs.Recorder.__new__(hs.Recorder)
+g3.cfg = dict(hs.DEFAULTS)
+g3.conn = hs.connect()
+g3.emitted = None
+g3.dropped_ocr = 0
+g3.last_hash = None
+g3.coverage_cache = {"coverageDays": 0, "coverageText": "", "coverageBasis": "default"}
+g3.coverage_at = time.time()
+saved = (hs.session_locked, hs.focused_monitor, hs.active_window,
+         hs.visible_windows, hs.visible_layers)
+hs.session_locked = lambda: False
+hs.focused_monitor = lambda: (True, "DP-1", True)
+hs.active_window = lambda: (True, "com.mitchellh.ghostty", "work")
+hs.visible_windows = lambda m: (True, [("com.mitchellh.ghostty", "work")])
+hs.visible_layers = lambda m: (True, ["mako"])
+try:
+    g3.tick()
+finally:
+    (hs.session_locked, hs.focused_monitor, hs.active_window,
+     hs.visible_windows, hs.visible_layers) = saved
+    hs.capture = real_capture2
+check("a notification on screen stops the recorder reaching capture",
+      not overlay_seen, overlay_seen)
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 if FAIL:
