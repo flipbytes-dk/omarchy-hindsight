@@ -487,6 +487,82 @@ check("a recorder with failing probes never calls capture", not captured, captur
 check("and stores no frame", hs.usage(gate.conn)[0] == before)
 hs.capture = real_capture
 
+print("\n-- a planted symlink must not redirect a chmod or a delete --")
+bait_dir = os.path.join(TMP, "bait")
+os.makedirs(bait_dir, exist_ok=True)
+bait = os.path.join(bait_dir, "someone-elses-secret")
+open(bait, "w").write("not ours")
+os.chmod(bait, 0o644)
+
+# A link inside the archive pointing at a file outside it.
+link = os.path.join(hs.FRAMES, "innocent.webp")
+if os.path.lexists(link):
+    os.remove(link)
+os.symlink(bait, link)
+
+hs.harden_all()
+check("the repair does not chmod through a symlink",
+      (os.stat(bait).st_mode & 0o777) == 0o644,
+      oct(os.stat(bait).st_mode & 0o777))
+check("and leaves the link itself in place", os.path.islink(link))
+
+# A database row naming that link must not delete what it points at.
+attack = hs.connect()
+fid = hs.store(attack, time.time(), link, "app", "t", "DP-1", 1, 10)
+hs.drop_frames(attack, [(fid, link)])
+check("deleting a frame does not follow a symlink out of the archive",
+      os.path.exists(bait))
+check("the poisoned row is dropped so pruning keeps making progress",
+      attack.execute("SELECT COUNT(*) FROM frames WHERE id=?",
+                     (fid,)).fetchone()[0] == 0)
+os.remove(link)
+
+# A row pointing straight at something outside the archive.
+outside = os.path.join(bait_dir, "keep-me")
+open(outside, "w").write("keep")
+fid = hs.store(attack, time.time(), outside, "app", "t", "DP-1", 1, 10)
+hs.drop_frames(attack, [(fid, outside)])
+check("a row naming a path outside the archive deletes nothing",
+      os.path.exists(outside))
+
+escape = os.path.join(hs.FRAMES, "..", "..", "escape.txt")
+open(os.path.join(TMP, "escape.txt"), "w").write("x")
+fid = hs.store(attack, time.time(), escape, "app", "t", "DP-1", 1, 10)
+hs.drop_frames(attack, [(fid, escape)])
+check("a row using .. to climb out deletes nothing",
+      os.path.exists(os.path.join(TMP, "escape.txt")))
+
+# A real frame in the real place still gets deleted.
+real_day = os.path.join(hs.FRAMES, "2021-02-03")
+os.makedirs(real_day, exist_ok=True)
+real = os.path.join(real_day, "120000-001.webp")
+open(real, "wb").write(b"frame")
+fid = hs.store(attack, time.time(), real, "app", "t", "DP-1", 1, 5)
+hs.drop_frames(attack, [(fid, real)])
+check("a genuine frame is still deleted", not os.path.exists(real))
+
+print("\n-- config and state reads are bounded and refuse links --")
+cfg_link = os.path.join(TMP, "config-link.json")
+if os.path.lexists(cfg_link):
+    os.remove(cfg_link)
+os.symlink(bait, cfg_link)
+check("a symlinked config is ignored", hs.read_private(cfg_link) is None)
+
+huge = os.path.join(TMP, "huge.json")
+with open(huge, "w") as fh:
+    fh.write("{}" + " " * (hs.MAX_TEXT_BYTES + 10))
+check("an oversized config is ignored", hs.read_private(huge) is None)
+
+small = os.path.join(TMP, "small.json")
+open(small, "w").write('{"ok": true}')
+check("a normal file still reads", hs.read_private(small) == '{"ok": true}')
+
+check("writing refuses to go through a symlink",
+      hs.write_private(cfg_link, "overwritten") is False)
+check("and the link target is untouched",
+      open(bait).read() == "not ours")
+os.remove(cfg_link)
+
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 if FAIL:
     print("failed: " + ", ".join(FAIL))

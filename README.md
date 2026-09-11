@@ -127,6 +127,13 @@ This plugin exists to remember your screen, so it is built to be told no.
   while paused. It is never ambiguous about what it is doing.
 - **Locked and asleep screens are skipped**, as is a monitor whose DPMS is off,
   and so is the screensaver: idle time is not a memory worth keeping.
+- **Names are never trusted.** Permissions are repaired through file
+  descriptors opened with `O_NOFOLLOW`, so a symlink planted in the archive
+  cannot redirect a `chmod` onto something else. Deletion walks into the
+  archive one component at a time and removes only a regular file you own
+  that is genuinely inside it, so a tampered database cannot turn pruning
+  into a way to delete your files. Config and state are read no-follow and
+  size-bounded.
 - **Every check fails closed.** If the compositor cannot say which window is
   focused, or whether the session is locked, or whether the screen is on, the
   frame is not taken. A blocklist is worth no more than the probe behind it,

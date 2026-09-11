@@ -18,6 +18,7 @@ import re
 import shutil
 import signal
 import sqlite3
+import stat as statmod
 import subprocess
 import sys
 import threading
@@ -82,8 +83,10 @@ OCR_QUEUE_MAX = 8    # bounded: OCR is ~1.5s, capture is ~40ms; drop, never lag
 def load_config():
     cfg = dict(DEFAULTS)
     try:
-        with open(CONFIG, "r", encoding="utf-8") as fh:
-            user = json.load(fh)
+        raw = read_private(CONFIG)
+        if raw is None:
+            raise FileNotFoundError(CONFIG)
+        user = json.loads(raw)
         if isinstance(user, dict):
             for key, value in user.items():
                 if key in cfg and value is not None:
@@ -103,28 +106,164 @@ def log(message):
     sys.stderr.flush()
 
 
-def secure(path, mode):
-    """Force a private mode, ignoring anything already gone (a pruned frame)."""
+MAX_TEXT_BYTES = 256 * 1024   # config and state are small; anything larger is not ours
+
+
+def read_private(path, limit=MAX_TEXT_BYTES):
+    """Read a small file of ours, refusing links, odd types and runaway size.
+
+    Returns None when the file is missing or fails any of those checks, so
+    every caller falls back to defaults rather than to whatever was there."""
+    fd = None
     try:
-        if (os.stat(path).st_mode & 0o777) != mode:
-            os.chmod(path, mode)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        info = os.fstat(fd)
+        if not statmod.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            log("ignoring %s: not a regular file of ours" % path)
+            return None
+        if info.st_size > limit:
+            log("ignoring %s: larger than %d bytes" % (path, limit))
+            return None
+        chunks = []
+        total = 0
+        while total <= limit:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > limit:
+            log("ignoring %s: larger than %d bytes" % (path, limit))
+            return None
+        return b"".join(chunks).decode("utf-8", "replace")
+    except OSError:
+        return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def write_private(path, data):
+    """Create or replace a file of ours, never through a symlink."""
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    fd = None
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                     FILE_MODE)
+        os.fchmod(fd, FILE_MODE)
+        os.write(fd, data)
+        return True
+    except OSError as exc:
+        log("could not write %s (%s)" % (path, exc))
+        return False
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def secure(path, mode, dir_fd=None, name=None):
+    """Set a private mode through a descriptor rather than a pathname.
+
+    os.chmod follows symlinks, so a link planted in the archive would have
+    made the startup repair change the mode of something else entirely.
+    Opening with O_NOFOLLOW refuses the link, and fchmod then acts on the
+    object actually opened rather than on whatever the name meant a moment
+    ago. Anything owned by another user, or of the wrong type, is left
+    alone."""
+    want_dir = (mode == DIR_MODE)
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    if want_dir:
+        flags |= os.O_DIRECTORY
+    fd = None
+    try:
+        if dir_fd is not None:
+            fd = os.open(name, flags, dir_fd=dir_fd)
+        else:
+            fd = os.open(path, flags)
+        info = os.fstat(fd)
+        if info.st_uid != os.getuid():
+            return False
+        if want_dir and not statmod.S_ISDIR(info.st_mode):
+            return False
+        if not want_dir and not statmod.S_ISREG(info.st_mode):
+            return False
+        if (info.st_mode & 0o777) != mode:
+            os.fchmod(fd, mode)
             return True
     except OSError:
         pass
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
     return False
+
+
+def harden_dir(fd, path):
+    """Repair one directory's contents, descending through descriptors only."""
+    fixed = 0
+    try:
+        entries = list(os.scandir(fd))
+    except OSError:
+        return 0
+    for entry in entries:
+        try:
+            if entry.is_symlink():
+                # Never repair a link. Pointing at somebody else's file is
+                # the whole trick, and the link itself carries no mode worth
+                # keeping.
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                if secure(None, DIR_MODE, dir_fd=fd, name=entry.name):
+                    fixed += 1
+                child = None
+                try:
+                    child = os.open(entry.name,
+                                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                    dir_fd=fd)
+                    fixed += harden_dir(child, os.path.join(path, entry.name))
+                except OSError:
+                    pass
+                finally:
+                    if child is not None:
+                        try:
+                            os.close(child)
+                        except OSError:
+                            pass
+            elif entry.is_file(follow_symlinks=False):
+                if secure(None, FILE_MODE, dir_fd=fd, name=entry.name):
+                    fixed += 1
+        except OSError:
+            continue
+    return fixed
 
 
 def harden_tree(root):
     """Repair permissions written by an earlier, more careless version."""
-    fixed = 0
     if not os.path.isdir(root):
         return 0
-    fixed += 1 if secure(root, DIR_MODE) else 0
-    for base, dirs, files in os.walk(root):
-        for name in dirs:
-            fixed += 1 if secure(os.path.join(base, name), DIR_MODE) else 0
-        for name in files:
-            fixed += 1 if secure(os.path.join(base, name), FILE_MODE) else 0
+    fixed = 1 if secure(root, DIR_MODE) else 0
+    fd = None
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        fixed += harden_dir(fd, root)
+    except OSError:
+        pass
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
     return fixed
 
 
@@ -454,16 +593,80 @@ def attach_text(conn, frame_id, text, app, title):
     conn.commit()
 
 
-def drop_frames(conn, rows):
-    """Delete frames from disk and both tables. rows is [(id, path), ...]."""
-    removed = 0
-    for frame_id, path in rows:
+def unlink_frame(path):
+    """Delete one frame, refusing anything that is not a regular file we own
+    inside the archive.
+
+    The path comes out of the database, and the database is a file on disk
+    like any other. Handing whatever it says to os.remove() would turn prune
+    and forget into a way to delete arbitrary files, so every component is
+    opened with O_NOFOLLOW: a symlink anywhere along the way stops the walk
+    instead of redirecting it.
+
+    True means the row may go, because the file is gone or was never a frame
+    of ours. False means try again later, so a missing mount or a busy file
+    does not quietly empty the index."""
+    try:
+        rel = os.path.relpath(path, FRAMES)
+    except ValueError:
+        log("refusing to delete %s: outside the archive" % path)
+        return True
+    parts = rel.split(os.sep)
+    if os.path.isabs(rel) or any(part in ("", ".", "..") for part in parts):
+        log("refusing to delete %s: outside the archive" % path)
+        return True
+
+    open_fds = []
+    try:
         try:
-            os.remove(path)
+            fd = os.open(FRAMES, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError as exc:
+            log("cannot open the archive (%s); leaving %s alone" % (exc, path))
+            return False
+        open_fds.append(fd)
+        for part in parts[:-1]:
+            try:
+                fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                             dir_fd=open_fds[-1])
+            except FileNotFoundError:
+                return True
+            except OSError as exc:
+                log("refusing to delete %s (%s)" % (path, exc))
+                return True
+            open_fds.append(fd)
+
+        name = parts[-1]
+        try:
+            info = os.stat(name, dir_fd=open_fds[-1], follow_symlinks=False)
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            log("could not inspect %s (%s)" % (path, exc))
+            return False
+        if not statmod.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            log("refusing to delete %s: not a regular file of ours" % path)
+            return True
+        try:
+            os.unlink(name, dir_fd=open_fds[-1])
         except FileNotFoundError:
             pass
         except OSError as exc:
             log("could not remove %s (%s)" % (path, exc))
+            return False
+        return True
+    finally:
+        for fd in reversed(open_fds):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def drop_frames(conn, rows):
+    """Delete frames from disk and both tables. rows is [(id, path), ...]."""
+    removed = 0
+    for frame_id, path in rows:
+        if not unlink_frame(path):
             continue
         conn.execute("DELETE FROM frames WHERE id=?", (frame_id,))
         conn.execute("DELETE FROM frames_fts WHERE rowid=?", (frame_id,))
@@ -683,8 +886,10 @@ def save_config(patch):
     ensure_dirs()
     current = {}
     try:
-        with open(CONFIG, "r", encoding="utf-8") as fh:
-            loaded = json.load(fh)
+        raw = read_private(CONFIG)
+        if raw is None:
+            raise FileNotFoundError(CONFIG)
+        loaded = json.loads(raw)
         if isinstance(loaded, dict):
             current = loaded
     except FileNotFoundError:
@@ -694,11 +899,13 @@ def save_config(patch):
         current = dict(DEFAULTS)
     current.update(patch)
     tmp = CONFIG + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(current, fh, indent=2, sort_keys=True)
-    secure(tmp, FILE_MODE)
-    os.replace(tmp, CONFIG)
-    secure(CONFIG, FILE_MODE)
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    if write_private(tmp, json.dumps(current, indent=2, sort_keys=True)):
+        os.replace(tmp, CONFIG)
+        secure(CONFIG, FILE_MODE)
     return current
 
 
@@ -828,9 +1035,7 @@ class Recorder:
             return
         self.emitted = compact
         try:
-            with open(STATE_PATH, "w", encoding="utf-8") as fh:
-                json.dump(state, fh)
-            secure(STATE_PATH, FILE_MODE)
+            write_private(STATE_PATH, json.dumps(state))
         except OSError:
             pass
         sys.stdout.write(compact + "\n")
@@ -893,9 +1098,9 @@ class Recorder:
         now = time.time()
         _, path = frame_path(now)
         try:
-            with open(path, "wb") as fh:
-                fh.write(webp)
-            secure(path, FILE_MODE)
+            if not write_private(path, webp):
+                self.emit(reason="could not write frame", capturing=False)
+                return
         except OSError as exc:
             self.emit(reason="disk error: %s" % exc, capturing=False)
             return
@@ -1063,8 +1268,10 @@ def cmd_text(args):
 
 def cmd_status(_args):
     try:
-        with open(STATE_PATH, "r", encoding="utf-8") as fh:
-            state = json.load(fh)
+        raw = read_private(STATE_PATH)
+        state = json.loads(raw) if raw else {}
+        if not isinstance(state, dict):
+            state = {}
     except Exception:
         state = {}
     conn = connect()
@@ -1079,9 +1286,7 @@ def cmd_status(_args):
 def set_paused(paused):
     ensure_dirs()
     if paused:
-        with open(PAUSE_MARKER, "w", encoding="utf-8") as fh:
-            fh.write(str(time.time()))
-        secure(PAUSE_MARKER, FILE_MODE)
+        write_private(PAUSE_MARKER, str(time.time()))
     else:
         try:
             os.remove(PAUSE_MARKER)
@@ -1272,9 +1477,7 @@ def cmd_budget(args):
 def cmd_config(_args):
     ensure_dirs()
     if not os.path.exists(CONFIG):
-        with open(CONFIG, "w", encoding="utf-8") as fh:
-            json.dump(DEFAULTS, fh, indent=2, sort_keys=True)
-        secure(CONFIG, FILE_MODE)
+        write_private(CONFIG, json.dumps(DEFAULTS, indent=2, sort_keys=True))
     print(CONFIG)
     return 0
 
