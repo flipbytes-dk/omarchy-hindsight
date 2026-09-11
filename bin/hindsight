@@ -12,6 +12,7 @@ implementation detail - see doctor().
 
 import difflib
 import json
+import math
 import os
 import queue
 import re
@@ -56,7 +57,6 @@ DEFAULTS = {
         "screensaver", "org.omarchy.screensaver",
     ],
     "blocklistTitles": [],
-    "captureOnBattery": True,
 }
 
 # A record of everything that has been on screen is the most private thing on
@@ -115,7 +115,13 @@ def load_config():
                              ("quality", 1, int),
                              ("ocrTimeout", 1, int)):
         try:
-            cfg[key] = max(floor, cast(cfg[key]))
+            value = cast(cfg[key])
+            # float() accepts Infinity where int() raises, and json.loads
+            # accepts the bare literal, so one token in the config could set
+            # interval to inf and stop the recorder after a single tick.
+            if not math.isfinite(value):
+                raise ValueError("not a finite number")
+            cfg[key] = max(floor, value)
         except (TypeError, ValueError, OverflowError):
             log("config value for %s (%r) is not usable; using %r"
                 % (key, cfg[key], DEFAULTS[key]))
@@ -409,6 +415,11 @@ def secure(path, mode, dir_fd=None, name=None):
         if (info.st_mode & 0o777) != mode:
             os.fchmod(fd, mode)
             return True
+    except PermissionError:
+        # A file whose owner cannot read it still has to be repaired: those
+        # are precisely the ones violating the rule. O_PATH opens without
+        # read permission, and the mode is changed through the descriptor.
+        return secure_by_path(path, mode, dir_fd, name)
     except OSError:
         pass
     finally:
@@ -418,6 +429,38 @@ def secure(path, mode, dir_fd=None, name=None):
             except OSError:
                 pass
     return False
+
+
+def secure_by_path(path, mode, dir_fd=None, name=None):
+    """chmod through /proc/self/fd of an O_PATH descriptor.
+
+    O_PATH refuses to follow a final symlink with O_NOFOLLOW and needs no
+    read permission, so this reaches files plain open() cannot."""
+    fd = None
+    try:
+        flags = os.O_PATH | os.O_NOFOLLOW
+        if dir_fd is not None:
+            fd = os.open(name, flags, dir_fd=dir_fd)
+        else:
+            fd = os.open(path, flags)
+        info = os.stat(fd)
+        if info.st_uid != os.getuid():
+            return False
+        if not (statmod.S_ISREG(info.st_mode) or statmod.S_ISDIR(info.st_mode)):
+            return False
+        if (info.st_mode & 0o777) == mode:
+            return False
+        os.chmod("/proc/self/fd/%d" % fd, mode)
+        return True
+    except OSError as exc:
+        log("could not repair permissions on %s (%s)" % (name or path, exc))
+        return False
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def harden_dir(fd, path, depth=0):
@@ -464,15 +507,15 @@ def harden_dir(fd, path, depth=0):
 
 def harden_tree(root):
     """Repair permissions written by an earlier, more careless version."""
-    if not os.path.isdir(root):
-        return 0
     fixed = 1 if secure(root, DIR_MODE) else 0
     fd = None
     try:
         fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         fixed += harden_dir(fd, root)
-    except OSError:
-        pass
+    except OSError as exc:
+        # Saying nothing here is how a symlinked archive root produced a
+        # confident "0 paths repaired" while nothing was repaired at all.
+        log("cannot repair permissions under %s (%s)" % (root, exc))
     finally:
         if fd is not None:
             try:
@@ -750,9 +793,9 @@ def visible_windows(monitor_name):
             space = mon.get(key)
             if isinstance(space, dict) and space.get("id") is not None:
                 visible.add(space.get("id"))
-    if not found:
-        # No monitor by that name: better to stop than to guess which
-        # workspaces are on screen.
+    if not found or not visible:
+        # No monitor by that name, or one that told us nothing about its
+        # workspaces: better to stop than to guess what is on screen.
         return False, []
 
     code, out, _ = run(["hyprctl", "clients", "-j"], timeout=3)
@@ -770,8 +813,11 @@ def visible_windows(monitor_name):
         if not isinstance(client, dict):
             return False, []
         space = client.get("workspace")
-        space_id = space.get("id") if isinstance(space, dict) else None
-        if space_id not in visible:
+        if not isinstance(space, dict) or space.get("id") is None:
+            # A window whose workspace cannot be read is a window whose
+            # visibility cannot be read. Do not quietly drop it.
+            return False, []
+        if space.get("id") not in visible:
             continue
         if client.get("mapped") is False or client.get("hidden") is True:
             continue
@@ -781,7 +827,11 @@ def visible_windows(monitor_name):
 
 
 def login_sessions():
-    """Session ids worth asking about the lock state, best first."""
+    """Session ids worth asking about the lock state.
+
+    The systemd user manager owns a session too, with class "manager", and it
+    reports LockedHint=no forever. Asking it first and believing the first
+    answer meant a locked graphical session read as unlocked."""
     ids = []
     from_env = os.environ.get("XDG_SESSION_ID")
     if from_env:
@@ -792,9 +842,49 @@ def login_sessions():
         mine = str(os.getuid())
         for line in out.decode("utf-8", "replace").splitlines():
             fields = line.split()
-            if len(fields) >= 2 and fields[1] == mine and fields[0] not in ids:
+            if len(fields) < 2 or fields[1] != mine:
+                continue
+            # CLASS column: keep real login sessions, drop "manager".
+            if len(fields) >= 6 and fields[5] != "user":
+                continue
+            if fields[0] not in ids:
                 ids.append(fields[0])
     return ids
+
+
+def visible_layers(monitor_name):
+    """(probed, [namespace, ...]) for layer surfaces drawn on one output.
+
+    Notifications, launchers and overlays are not toplevel windows, so
+    `hyprctl clients` cannot see them, but grim composites them into the
+    frame. A notification showing a one-time code is exactly the thing the
+    blocklist is for."""
+    code, out, _ = run(["hyprctl", "layers", "-j"], timeout=3)
+    if code != 0:
+        return False, []
+    try:
+        data = json.loads(out.decode("utf-8", "replace") or "{}")
+    except Exception:
+        return False, []
+    if not isinstance(data, dict):
+        return False, []
+    names = []
+    for output, body in data.items():
+        if monitor_name and output != monitor_name:
+            continue
+        if not isinstance(body, dict):
+            return False, []
+        levels = body.get("levels")
+        if not isinstance(levels, dict):
+            return False, []
+        for surfaces in levels.values():
+            if not isinstance(surfaces, list):
+                return False, []
+            for surface in surfaces:
+                if not isinstance(surface, dict):
+                    return False, []
+                names.append(str(surface.get("namespace") or ""))
+    return True, names
 
 
 def session_locked():
@@ -813,6 +903,7 @@ def session_locked():
     # `loginctl show-session self` exits 1 with "Caller does not belong to any
     # known session", so asking only that way made the lock state permanently
     # unknown and, with the fail-closed rule, stopped capture for good.
+    unlocked = False
     for session in login_sessions():
         code, out, _ = run(["loginctl", "show-session", session,
                             "-p", "LockedHint", "--value"], timeout=3)
@@ -820,9 +911,14 @@ def session_locked():
             continue
         hint = out.decode("utf-8", "replace").strip().lower()
         if hint == "yes":
+            # One session saying it is locked settles it. Returning on the
+            # first answer instead let a session that can never lock speak
+            # for one that had.
             return True
         if hint == "no":
-            return False
+            unlocked = True
+    if unlocked:
+        return False
     # Knowing that a handful of named lockers are absent is not the same as
     # knowing the session is unlocked; only an explicit "no" is.
     return None
@@ -871,6 +967,11 @@ def encode_webp(ppm, quality):
     return out, ""
 
 
+# 0 not read yet, 1 read, 2 read but unreadable image, 3 no OCR tool -
+# 3 is retried, because installing tesseract should heal the archive.
+OCR_PENDING, OCR_DONE, OCR_DONE_UNREADABLE, OCR_TOOL_MISSING = 0, 1, 2, 3
+
+
 def ocr_frame_file(path, timeout):
     """Recover text from a frame already on disk.
 
@@ -887,11 +988,20 @@ def ocr_frame_file(path, timeout):
     return ocr_text(ppm, timeout)
 
 
+def ocr_available():
+    code, _, _ = run(["tesseract", "--version"], timeout=5)
+    return code == 0
+
+
 def ocr_text(ppm, timeout):
     code, out, _ = run(["nice", "-n", "19", "tesseract", "-", "stdout",
                         "--psm", "6"], timeout=timeout, stdin_bytes=ppm)
     if code != 0:
-        return ""
+        # None means "could not read", "" means "read it, no words on it".
+        # Conflating them marked frames captured while tesseract was missing
+        # as read-with-no-text, permanently and invisibly: pendingOcr showed
+        # zero, and installing tesseract afterwards changed nothing.
+        return None
     text = out.decode("utf-8", "replace")
     # tesseract emits a lot of whitespace scaffolding around real words.
     lines = [" ".join(line.split()) for line in text.splitlines()]
@@ -920,6 +1030,14 @@ def store(conn, ts, path, app, title, monitor, hash_bits, size):
         (ts, day, path, app, title, monitor, str(hash_bits), size))
     conn.commit()
     return cur.lastrowid
+
+
+def note_ocr_failure(conn, frame_id):
+    """Record why the text is missing, so the frame can be retried or not."""
+    state = OCR_DONE_UNREADABLE if ocr_available() else OCR_TOOL_MISSING
+    conn.execute("UPDATE frames SET ocr=? WHERE id=?", (state, frame_id))
+    conn.commit()
+    return state
 
 
 def attach_text(conn, frame_id, text, app, title):
@@ -1009,14 +1127,19 @@ def prune(conn, cfg):
         # Materialise the candidates first: deleting rows from under a live
         # cursor on the same table silently skips frames, so the archive would
         # creep over budget forever.
+        # The column only decides *whether* to look; what gets deleted is
+        # sized from disk. One edited row could otherwise still delete most
+        # of the archive, because it controls the row count as well as the
+        # value, and the loop walks oldest-first.
+        rows = conn.execute("SELECT id,path,bytes FROM frames ORDER BY ts").fetchall()
+        real = [(fid, path, disk_size(path, size)) for fid, path, size in rows]
+        running = sum(size for _, _, size in real)
         doomed = []
-        running = total
-        for frame_id, path, size in conn.execute(
-                "SELECT id,path,bytes FROM frames ORDER BY ts").fetchall():
+        for frame_id, path, size in real:
             if running <= budget:
                 break
             doomed.append((frame_id, path))
-            running -= frame_bytes(size)
+            running -= size
         removed += drop_frames(conn, doomed)
     if removed:
         empty_dirs()
@@ -1031,6 +1154,23 @@ def empty_dirs():
                 os.rmdir(path)
     except OSError:
         pass
+
+
+def disk_size(path, recorded):
+    """What a frame actually occupies, asked of the filesystem.
+
+    Falls back to the clamped column only when the file cannot be measured,
+    so a vanished frame does not stall pruning."""
+    fds, name = archive_descend(path)
+    if fds is None:
+        return frame_bytes(recorded)
+    try:
+        return min(os.stat(name, dir_fd=fds[-1],
+                           follow_symlinks=False).st_size, MAX_FRAME_BYTES)
+    except OSError:
+        return 0
+    finally:
+        close_fds(fds)
 
 
 def frame_bytes(value):
@@ -1050,8 +1190,12 @@ def frame_bytes(value):
 
 
 def usage(conn):
-    rows = conn.execute("SELECT bytes FROM frames").fetchall()
-    return len(rows), sum(frame_bytes(row[0]) for row in rows)
+    # Clamped in SQL rather than in Python: emit() calls this every tick, and
+    # materialising every row was measured 7.8x slower on a large archive.
+    row = conn.execute(
+        "SELECT COUNT(*), COALESCE(SUM(MIN(MAX(COALESCE(bytes,0),0),?)),0)"
+        " FROM frames", (MAX_FRAME_BYTES,)).fetchone()
+    return int(row[0]), int(row[1])
 
 
 def index_bytes():
@@ -1269,7 +1413,10 @@ class Recorder:
             frame_id, ppm, app, title = job
             try:
                 text = ocr_text(ppm, self.cfg["ocrTimeout"])
-                attach_text(conn, frame_id, text, app, title)
+                if text is None:
+                    note_ocr_failure(conn, frame_id)
+                else:
+                    attach_text(conn, frame_id, text, app, title)
             except Exception as exc:
                 log("ocr failed for frame %s (%s)" % (frame_id, exc))
             finally:
@@ -1280,8 +1427,9 @@ class Recorder:
         if not self.cfg.get("ocr"):
             return
         row = conn.execute(
-            "SELECT id,path,app,title FROM frames WHERE ocr=0"
-            " ORDER BY ts DESC LIMIT 1").fetchone()
+            "SELECT id,path,app,title FROM frames WHERE ocr IN (?,?)"
+            " ORDER BY ts DESC LIMIT 1",
+            (OCR_PENDING, OCR_TOOL_MISSING)).fetchone()
         if not row:
             return
         frame_id, path, app, title = row
@@ -1293,8 +1441,7 @@ class Recorder:
         try:
             text = ocr_frame_file(path, self.cfg["ocrTimeout"])
             if text is None:
-                conn.execute("UPDATE frames SET ocr=2 WHERE id=?", (frame_id,))
-                conn.commit()
+                note_ocr_failure(conn, frame_id)
                 return
             attach_text(conn, frame_id, text, app, title)
         except Exception as exc:
@@ -1358,13 +1505,17 @@ class Recorder:
         compact = json.dumps(state, sort_keys=True)
         if compact == self.emitted:
             return
+        # Marked as sent only once both the file and the pipe have taken it.
+        # Setting it earlier meant one failed write wedged the bar on a stale
+        # state forever, because every later tick compared equal and returned.
+        if not write_private(STATE_PATH, json.dumps(state)):
+            return
         try:
-            write_private(STATE_PATH, json.dumps(state))
-            self.emitted = compact
-        except OSError:
-            pass
-        sys.stdout.write(compact + "\n")
-        sys.stdout.flush()
+            sys.stdout.write(compact + "\n")
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            return
+        self.emitted = compact
 
     def tick(self):
         # A blocklist the user just added has to take effect now, not at next
@@ -1410,8 +1561,14 @@ class Recorder:
         if not probed:
             self.emit(reason="window list unknown", capturing=False)
             return
+        seen_layers, layers = visible_layers(monitor)
+        if not seen_layers:
+            self.emit(reason="overlay list unknown", capturing=False)
+            return
+
         rule = ""
-        for other_app, other_title in windows + [(app, title)]:
+        for other_app, other_title in (windows + [(app, title)]
+                                       + [(name, "") for name in layers]):
             rule = blocked_by(self.cfg, other_app, other_title)
             if rule:
                 break
@@ -1501,19 +1658,24 @@ class Recorder:
 
 
 def inside_archive(path):
-    """True when a stored path really names a frame inside the archive.
+    """True when a stored path really names a frame we could open.
 
-    Search results feed the panel, which renders the path as an image, so a
-    row that has been tampered with must not be able to point the viewer at
-    an arbitrary file."""
-    try:
-        rel = os.path.relpath(path or "", FRAMES)
-    except ValueError:
+    Search results feed the panel, which renders the path as an image, so
+    this has to agree with the walk the rest of the program uses. As a pure
+    string test it was strictly weaker: it accepted names that
+    archive_descend refuses, and it could not see a symlink at all, so a
+    planted link still reached the viewer.
+    """
+    fds, name = archive_descend(path or "")
+    if fds is None:
         return False
-    parts = rel.split(os.sep)
-    return (not os.path.isabs(rel)
-            and len(parts) <= MAX_ARCHIVE_DEPTH
-            and not any(part in ("", ".", "..") for part in parts))
+    try:
+        info = os.stat(name, dir_fd=fds[-1], follow_symlinks=False)
+        return statmod.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+    except OSError:
+        return False
+    finally:
+        close_fds(fds)
 
 
 def fts_query(term):
@@ -1773,6 +1935,12 @@ def cmd_doctor(_args):
                     pass
             if len(exposed) > 5:
                 break
+    locked_state = session_locked()
+    check("lock state", locked_state is not None,
+          "unlocked" if locked_state is False else
+          ("locked" if locked_state else
+           "no logind session answered, so capture stays off"))
+
     check("permissions", not exposed,
           "%d path(s) readable by other users, e.g. %s"
           % (len(exposed), exposed[0]) if exposed else "private to you")
@@ -1785,6 +1953,15 @@ def cmd_doctor(_args):
         check("disk", False, str(exc))
 
     conn = connect()
+    try:
+        stalled = conn.execute("SELECT COUNT(*) FROM frames WHERE ocr=?",
+                               (OCR_TOOL_MISSING,)).fetchone()[0]
+    except sqlite3.Error:
+        stalled = 0
+    check("text indexing", not stalled,
+          ("%d frame(s) captured while tesseract was unavailable; they are "
+           "retried automatically" % stalled) if stalled else "up to date")
+
     frames, total = usage(conn)
     report["frames"] = frames
     report["bytes"] = total

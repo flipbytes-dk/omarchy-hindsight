@@ -137,13 +137,14 @@ print("\n-- pruning: the ring buffer must actually close --")
 # This is the bug that shipped once: deleting rows from under a live cursor
 # skips frames, so the archive creeps over budget forever.
 big = hs.connect()
+BULK_BYTES = 200 * 1024
 for n in range(40):
     path = os.path.join(hs.FRAMES, "bulk%d.webp" % n)
-    open(path, "wb").write(b"y" * 1000)
-    hs.store(big, now - (100 - n) * 60, path, "app", "t", "DP-1", n, 1024 * 1024)
+    open(path, "wb").write(b"y" * BULK_BYTES)
+    hs.store(big, now - (100 - n) * 60, path, "app", "t", "DP-1", n, BULK_BYTES)
 before, bytes_before = hs.usage(big)
 cfg_small = dict(hs.DEFAULTS)
-cfg_small["budgetMB"] = 10
+cfg_small["budgetMB"] = 4
 cfg_small["retentionDays"] = 0
 removed = hs.prune(big, cfg_small)
 after, bytes_after = hs.usage(big)
@@ -340,13 +341,16 @@ variants = [
 # can only happen because of what the frames say, not what they look like.
 import random
 random.seed(11)
+os.makedirs(os.path.join(hs.FRAMES, "2021-05-05"), exist_ok=True)
 for index, text in enumerate(variants):
-    fid = hs.store(dedup, now + index,
-                   os.path.join(hs.FRAMES, "2021-05-05", "dup%d.webp" % index),
+    dup_path = os.path.join(hs.FRAMES, "2021-05-05", "dup%d.webp" % index)
+    open(dup_path, "wb").write(b"d" * 1000)
+    fid = hs.store(dedup, now + index, dup_path,
                    "app", "t", "DP-1", random.getrandbits(hs.HASH_BITS), 1000)
     hs.attach_text(dedup, fid, text, "app", "t")
-fid = hs.store(dedup, now + 9,
-               os.path.join(hs.FRAMES, "2021-05-05", "other.webp"),
+other_path = os.path.join(hs.FRAMES, "2021-05-05", "other.webp")
+open(other_path, "wb").write(b"o" * 1000)
+fid = hs.store(dedup, now + 9, other_path,
                "app", "t", "DP-1", random.getrandbits(hs.HASH_BITS), 1000)
 hs.attach_text(dedup, fid,
                "a different screen entirely about forecast wind speeds offshore",
@@ -681,6 +685,114 @@ finally:
     hs.capture = real_capture
 check("the recorder never reaches capture with a blocked window on screen",
       not seen, seen)
+
+print("\n-- the fail-opens the fixes themselves introduced --")
+
+def sessions(listing, answers):
+    def fake(cmd, **kwargs):
+        if cmd[0] == "pgrep":
+            return 1, b"", b""
+        if cmd[:2] == ["loginctl", "list-sessions"]:
+            return 0, listing.encode(), b""
+        if cmd[:2] == ["loginctl", "show-session"]:
+            return (0, answers.get(cmd[2], "no").encode(), b"")
+        return 1, b"", b""
+    return fake
+
+os.environ.pop("XDG_SESSION_ID", None)
+two = "2 1000 me - 920 manager - no -\n5 1000 me seat0 999 user tty2 no -\n"
+check("a locked session is not masked by the systemd user manager",
+      with_run(sessions(two, {"5": "yes", "2": "no"}), hs.session_locked) is True)
+check("the manager session is not asked at all",
+      "2" not in with_run(sessions(two, {}), hs.login_sessions),
+      with_run(sessions(two, {}), hs.login_sessions))
+check("every session saying no means unlocked",
+      with_run(sessions(two, {"5": "no"}), hs.session_locked) is False)
+
+blind = [{"name": "DP-1", "activeWorkspace": None, "specialWorkspace": None}]
+one_client = [{"class": "1Password", "title": "V", "workspace": {"id": 1},
+               "mapped": True, "hidden": False}]
+check("a monitor that reports no workspaces is not an empty screen",
+      with_run(hypr(blind, one_client),
+               lambda: hs.visible_windows("DP-1")) == (False, []))
+good_mon = [{"name": "DP-1", "activeWorkspace": {"id": 1}}]
+for shape in ("1", None, {"id": None}):
+    bad = [{"class": "1Password", "title": "V", "workspace": shape,
+            "mapped": True, "hidden": False}]
+    check("a client with workspace %r is not silently dropped" % (shape,),
+          with_run(hypr(good_mon, bad),
+                   lambda: hs.visible_windows("DP-1")) == (False, []))
+
+layers = {"DP-1": {"levels": {"2": [{"namespace": "1password-overlay"}]}}}
+def layer_run(cmd, **kwargs):
+    if cmd[:2] == ["hyprctl", "layers"]:
+        return 0, json.dumps(layers).encode(), b""
+    return 1, b"", b""
+probed, names = with_run(layer_run, lambda: hs.visible_layers("DP-1"))
+check("layer surfaces are enumerated", probed and names == ["1password-overlay"],
+      names)
+check("a blocked notification overlay is caught",
+      hs.blocked_by(hs.DEFAULTS, "1password-overlay", "") != "")
+check("an unreadable layer list is not an empty one",
+      with_run(lambda *a, **k: (1, b"", b"x"),
+               lambda: hs.visible_layers("DP-1")) == (False, []))
+
+check("an infinite interval falls back to the default",
+      hs.load_config.__module__ is not None)
+bad_cfg = dict(hs.DEFAULTS)
+open(os.environ["HINDSIGHT_CONFIG"], "w").write('{"interval": Infinity}')
+check("Infinity in the config cannot stop the recorder",
+      hs.load_config()["interval"] == hs.DEFAULTS["interval"],
+      hs.load_config()["interval"])
+os.remove(os.environ["HINDSIGHT_CONFIG"])
+
+print("\n-- deletion, repair and OCR must survive a hostile index --")
+poison = hs.connect()
+pday = os.path.join(hs.FRAMES, "2019-01-01")
+os.makedirs(pday, exist_ok=True)
+for i in range(60):
+    fp = os.path.join(pday, "%06d-000.webp" % i)
+    open(fp, "wb").write(b"x" * 1000)
+    hs.store(poison, 5000 + i, fp, "app", "t", "DP-1", i, 1000)
+kept_before = poison.execute(
+    "SELECT COUNT(*) FROM frames WHERE path LIKE ?", (pday + "%",)).fetchone()[0]
+poison.execute("UPDATE frames SET bytes=? WHERE path LIKE ?",
+               (hs.MAX_FRAME_BYTES, pday + "%"))
+poison.commit()
+big_cfg = dict(hs.DEFAULTS); big_cfg["budgetMB"] = 4096; big_cfg["retentionDays"] = 0
+hs.prune(poison, big_cfg)
+kept_after = poison.execute(
+    "SELECT COUNT(*) FROM frames WHERE path LIKE ?", (pday + "%",)).fetchone()[0]
+check("an inflated bytes column cannot delete the archive",
+      kept_after == kept_before, "%d -> %d" % (kept_before, kept_after))
+
+unreadable = os.path.join(pday, "000001-000.webp")
+os.chmod(unreadable, 0o044)
+hs.harden_all()
+check("a frame its owner cannot read is still repaired",
+      (os.stat(unreadable).st_mode & 0o777) == 0o600,
+      oct(os.stat(unreadable).st_mode & 0o777))
+
+sym = os.path.join(pday, "888888-000.webp")
+outside_target = os.path.join(TMP, "not-a-frame.png")
+open(outside_target, "wb").write(b"S")
+if os.path.lexists(sym):
+    os.remove(sym)
+os.symlink(outside_target, sym)
+check("a symlinked frame never reaches the panel", not hs.inside_archive(sym))
+check("a real frame still does",
+      hs.inside_archive(os.path.join(pday, "000002-000.webp")))
+
+fid = hs.store(poison, 6000, os.path.join(pday, "000003-000.webp"),
+               "app", "t", "DP-1", 1, 1000)
+with_run(lambda *a, **k: (127, b"", b"missing"),
+         lambda: hs.note_ocr_failure(poison, fid))
+check("a frame captured without tesseract stays queued for retry",
+      poison.execute("SELECT ocr FROM frames WHERE id=?",
+                     (fid,)).fetchone()[0] == hs.OCR_TOOL_MISSING)
+check("tesseract failing is not the same as a blank screen",
+      with_run(lambda *a, **k: (127, b"", b""),
+               lambda: hs.ocr_text(b"x", 5)) is None)
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 if FAIL:

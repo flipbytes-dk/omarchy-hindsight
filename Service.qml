@@ -63,10 +63,15 @@ Item {
     searcher.running = true
   }
 
+  // Pause gets its own Process. It used to share one with forget(), and a
+  // command assigned to a Process that is already running is ignored - so a
+  // pause pressed during a "forget everything" never ran, while the bar had
+  // already switched to the paused glyph and the panel said nothing was
+  // being captured.
   function setPaused(value) {
-    control.command = ["python3", root.helperPath, value ? "pause" : "resume"]
-    control.running = true
-    root.paused = value
+    pauser.running = false
+    pauser.command = ["python3", root.helperPath, value ? "pause" : "resume"]
+    pauser.running = true
   }
 
   // The options carry their own "about N weeks" text, computed from this
@@ -84,6 +89,7 @@ Item {
   }
 
   function forget(target) {
+    control.running = false
     control.command = ["python3", root.helperPath, "forget", target]
     control.running = true
     root.results = []
@@ -181,6 +187,24 @@ Item {
   Process {
     id: control
     running: false
+  }
+
+  // The recorder is the authority on whether it is paused: reporting it
+  // optimistically here is what let the bar claim "paused" while capture
+  // carried on. root.paused now changes only when the recorder says so.
+  Process {
+    id: pauser
+    running: false
+    stdout: StdioCollector {
+      onStreamFinished: {
+        try {
+          var data = JSON.parse(String(this.text))
+          if (data.paused !== undefined) root.paused = data.paused === true
+        } catch (e) {
+          // The next state line from the recorder will correct us.
+        }
+      }
+    }
   }
 
   Timer {
