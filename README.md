@@ -143,6 +143,10 @@ This plugin exists to remember your screen, so it is built to be told no.
   carries the daemon's name and not the name of whatever raised it. A frame
   is skipped while such a surface is actually drawn; one kept mapped at zero
   size or fully transparent between notifications does not stop recording.
+- **The gates are checked twice.** Every probe is answered before the
+  screenshot is taken, and a screen can lock or a notification can appear in
+  the gap. Any frame that is about to be kept is checked again first, while it
+  is still only in memory, and dropped if anything changed.
 - **Every check fails closed.** If the compositor cannot say which window is
   focused, or whether the session is locked, or whether the screen is on, the
   frame is not taken. A blocklist is worth no more than the probe behind it,
@@ -189,9 +193,9 @@ entirely; removing the key restores the defaults.
   "blocklist": ["1password", "bitwarden", "keepassxc", "keepass",
                 "gnome-keyring", "seahorse", "private browsing", "incognito",
                 "inprivate", "screensaver", "org.omarchy.screensaver"],
-  "blocklistLayers": ["mako", "swaync", "dunst", "fnott", "swaylock",
-                      "hyprlock", "wlogout", "rofi", "fuzzel", "wofi",
-                      "anyrun", "tofi"],
+  "blocklistLayers": ["mako", "swaync", "dunst", "fnott", "notifications",
+                      "swaylock", "hyprlock", "wlogout", "rofi", "fuzzel",
+                      "wofi", "anyrun", "tofi"],
   "blocklistTitles": []
 }
 ```
@@ -208,7 +212,7 @@ Frames and the index live in `~/.local/share/omarchy-hindsight/`.
 python3 tests/test-index.py
 ```
 
-169 offline checks covering the hashing, the blocklist, query sanitising, the
+193 offline checks covering the hashing, the blocklist, query sanitising, the
 search round trip, ring-buffer pruning, age retention, index migration, and the
 frame-vanished-under-the-backfill case — none of which need a screen.
 

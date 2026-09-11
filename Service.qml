@@ -70,6 +70,7 @@ Item {
   // being captured.
   function setPaused(value) {
     pauser.running = false
+    pauser.answered = false
     pauser.command = ["python3", root.helperPath, value ? "pause" : "resume"]
     pauser.running = true
   }
@@ -216,9 +217,10 @@ Item {
     // can die before printing anything at all. Either way the user pressed
     // pause and needs to know it did not take.
     onExited: function (exitCode) {
+      // Reset on start, not here: exit and stdout drain are separate events,
+      // and clearing the flag on exit made the warning off by one run.
       if (exitCode !== 0 || !pauser.answered)
         console.warn("hindsight: pause/resume did not take (exit " + exitCode + ")")
-      pauser.answered = false
     }
   }
 

@@ -664,6 +664,7 @@ real_capture = hs.capture
 hs.capture = lambda monitor: (seen.append(monitor), (None, "must not run"))[1]
 gate2 = hs.Recorder.__new__(hs.Recorder)
 gate2.cfg = dict(hs.DEFAULTS)
+gate2.cfg_stamp = hs.config_stamp()
 gate2.conn = hs.connect()
 gate2.emitted = None
 gate2.dropped_ocr = 0
@@ -837,6 +838,7 @@ def counting(cmd, **kwargs):
 hs._ocr_probe.update({"ok": None, "at": 0.0})
 spinner = hs.Recorder.__new__(hs.Recorder)
 spinner.cfg = dict(hs.DEFAULTS)
+spinner.cfg_stamp = hs.config_stamp()
 fid = hs.store(conv, 400, os.path.join(cday, "000009-000.webp"),
                "app", "t", "DP-1", 1, 1000)
 conv.execute("UPDATE frames SET ocr=? WHERE id=?", (hs.OCR_TOOL_MISSING, fid))
@@ -997,6 +999,9 @@ real_capture2 = hs.capture
 hs.capture = lambda m: (overlay_seen.append(m), (None, "must not run"))[1]
 g3 = hs.Recorder.__new__(hs.Recorder)
 g3.cfg = dict(hs.DEFAULTS)
+# tick() reloads config when the stamp differs, which would discard the dict
+# set above and test whatever is on disk instead.
+g3.cfg_stamp = hs.config_stamp()
 g3.conn = hs.connect()
 g3.emitted = None
 g3.dropped_ocr = 0
@@ -1018,6 +1023,66 @@ finally:
     hs.capture = real_capture2
 check("a notification on screen stops the recorder reaching capture",
       not overlay_seen, overlay_seen)
+
+print("\n-- the rules themselves, so a dropped token cannot pass unnoticed --")
+for daemon in ("mako", "swaync", "dunst", "fnott", "notifications",
+               "swaylock", "hyprlock", "wlogout", "rofi", "fuzzel"):
+    check("%s is in the shipped layer rules" % daemon,
+          daemon in hs.DEFAULTS["blocklistLayers"])
+
+# Namespaces name themselves at one end or the other; a widget that merely
+# mentions the word is neither.
+for namespace, want in (
+        ("mako", True), ("notifications", True),
+        ("swaync-control-center", True), ("swaync_control_center", True),
+        ("dunst_popup", True), ("mako.surface", True),
+        ("org.freedesktop.Notifications", True), ("ags-notifications", True),
+        ("eww-notifications-bar", False), ("my-notifications-widget", False),
+        ("omarchy-bar", False), ("omarchy-background", False)):
+    got = bool(hs.blocked_layer(hs.DEFAULTS, [namespace]))
+    check("%-32s %s" % (namespace, "blocks" if want else "does not block"),
+          got == want, "blocked=%s" % got)
+
+print("\n-- a frame is re-checked after the shutter, not only before it --")
+late_seen = []
+real_capture3 = hs.capture
+hs.capture = lambda m: (ppm_frame, None)
+ppm_frame = ppm(8, 8, lambda x, y: (x * 9, y * 9, 0))
+g4 = hs.Recorder.__new__(hs.Recorder)
+g4.cfg = dict(hs.DEFAULTS)
+g4.cfg_stamp = hs.config_stamp()
+g4.conn = hs.connect()
+g4.emitted = None
+g4.dropped_ocr = 0
+g4.last_hash = None
+g4.coverage_cache = {"coverageDays": 0, "coverageText": "", "coverageBasis": "default"}
+g4.coverage_at = time.time()
+g4.jobs = __import__("queue").Queue(maxsize=4)
+
+saved2 = (hs.session_locked, hs.focused_monitor, hs.active_window,
+          hs.visible_windows, hs.visible_layers, hs.encode_webp)
+calls = {"lock": 0}
+def locks_late():
+    calls["lock"] += 1
+    return calls["lock"] > 1      # clear before the shutter, locked after
+hs.session_locked = locks_late
+hs.focused_monitor = lambda: (True, "DP-1", True)
+hs.active_window = lambda: (True, "ghostty", "work")
+hs.visible_windows = lambda m: (True, [("ghostty", "work")])
+hs.visible_layers = lambda m: (True, [])
+hs.encode_webp = lambda p, q: (late_seen.append("encoded"), (b"x", None))[1]
+frames_before = hs.usage(g4.conn)[0]
+try:
+    g4.tick()
+finally:
+    (hs.session_locked, hs.focused_monitor, hs.active_window,
+     hs.visible_windows, hs.visible_layers, hs.encode_webp) = saved2
+    hs.capture = real_capture3
+check("a screen locked between the gate and the shutter drops the frame",
+      not late_seen and hs.usage(g4.conn)[0] == frames_before,
+      "encoded=%s" % late_seen)
+check("and the lock was asked again after the capture", calls["lock"] == 2,
+      calls["lock"])
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 if FAIL:

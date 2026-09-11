@@ -62,8 +62,9 @@ DEFAULTS = {
     # toast, so the daemons are named directly: a frame is skipped while any
     # notification is on screen, because the code in it is not ours to judge.
     "blocklistLayers": [
-        "mako", "swaync", "dunst", "fnott", "swaylock", "hyprlock",
-        "wlogout", "rofi", "fuzzel", "wofi", "anyrun", "tofi",
+        "mako", "swaync", "dunst", "fnott", "notifications",
+        "swaylock", "hyprlock", "wlogout", "rofi", "fuzzel", "wofi",
+        "anyrun", "tofi",
     ],
     "blocklistTitles": [],
 }
@@ -983,7 +984,13 @@ def blocked_layer(cfg, namespaces):
             # swaync-control-center and should match, but a status bar called
             # eww-notifications-bar is not a notification daemon and blocking
             # it would stop the recorder for good.
-            if hay == token or hay.startswith(token + "-"):
+            # Namespaces name themselves at one end or the other:
+            # "swaync-control-center" leads with the daemon, while a
+            # reverse-DNS name like "org.freedesktop.Notifications" ends with
+            # it. Matching either end catches both and still leaves a status
+            # bar called "eww-notifications-bar" alone, which is neither.
+            parts = re.split(r"[-._]", hay)
+            if hay == token or parts[0] == token or parts[-1] == token:
                 return str(needle)
     return ""
 
@@ -1707,14 +1714,11 @@ class Recorder:
         # Every gate below fails closed. If a probe cannot answer, the frame
         # is not taken: the cost of a missed frame is a gap in the archive,
         # and the cost of a wrong answer is a recorded password.
-        locked = session_locked()
-        if locked is None:
-            self.emit(reason="lock state unknown", capturing=False)
-            return
-        if locked:
-            self.emit(reason="locked", capturing=False)
-            return
-
+        #
+        # The lock check runs last of the probes rather than first. It is the
+        # slowest (four pgrep spawns and a loginctl call, ~105 ms measured)
+        # and the most consequential, so asking it first meant its answer was
+        # the stalest thing in the frame.
         probed, monitor, awake = focused_monitor()
         if not probed:
             self.emit(reason="display state unknown", capturing=False)
@@ -1751,6 +1755,14 @@ class Recorder:
             self.emit(reason="blocked", capturing=False, blockedBy=rule)
             return
 
+        locked = session_locked()
+        if locked is None:
+            self.emit(reason="lock state unknown", capturing=False)
+            return
+        if locked:
+            self.emit(reason="locked", capturing=False)
+            return
+
         ppm, err = capture(monitor)
         if ppm is None:
             self.emit(reason=err or "capture failed", capturing=False)
@@ -1763,6 +1775,34 @@ class Recorder:
 
         if distance(bits, self.last_hash) < self.cfg["changeBits"]:
             self.emit(reason="", capturing=True, app=app)
+            return
+
+        # Second look, now that this frame is going to be kept. Every gate
+        # above was answered before grim ran, and a screen can lock or a
+        # notification can finish fading in inside that gap. The frame is
+        # still only in memory here, so it costs nothing to drop it. Paid
+        # once per kept frame rather than once per tick, because change
+        # detection has already discarded the rest.
+        still_locked = session_locked()
+        if still_locked is not False:
+            self.emit(reason="locked", capturing=False)
+            return
+        seen_after, layers_after = visible_layers(monitor)
+        if not seen_after:
+            self.emit(reason="overlay list unknown", capturing=False)
+            return
+        late = blocked_layer(self.cfg, layers_after)
+        if not late:
+            seen_now, windows_now = visible_windows(monitor)
+            if not seen_now:
+                self.emit(reason="window list unknown", capturing=False)
+                return
+            for other_app, other_title in windows_now:
+                late = blocked_by(self.cfg, other_app, other_title)
+                if late:
+                    break
+        if late:
+            self.emit(reason="blocked", capturing=False, blockedBy=late)
             return
 
         webp, err = encode_webp(ppm, self.cfg["quality"])
@@ -2089,6 +2129,9 @@ def cmd_doctor(_args):
         seen, windows = visible_windows(monitor)
         for other_app, other_title in (windows if seen else []):
             blocked = blocked_by(cfg, other_app, other_title) or blocked
+        seen_layers, layers = visible_layers(monitor)
+        if seen_layers:
+            blocked = blocked_layer(cfg, layers) or blocked
     refuse = ""
     if os.path.exists(PAUSE_MARKER):
         refuse = "paused"
