@@ -137,7 +137,11 @@ This plugin exists to remember your screen, so it is built to be told no.
 - **The whole screen is checked, not just the focused window.** A capture
   takes the entire output, so every window sharing it has to clear the
   blocklist. A blocked app tiled beside the one you are using stops the
-  frame.
+  frame. Overlays count too: notifications, launchers and logout screens are
+  drawn as layer surfaces rather than windows, and `blocklistLayers` matches
+  them by the name of the program that drew them, because a notification
+  carries the daemon's name and not the name of whatever raised it. A frame
+  is skipped while a notification is on screen.
 - **Every check fails closed.** If the compositor cannot say which window is
   focused, or whether the session is locked, or whether the screen is on, the
   frame is not taken. A blocklist is worth no more than the probe behind it,
@@ -179,6 +183,7 @@ hindsight config                print (creating if needed) the config path
   "changeBits": 12,
   "ocr": true,
   "blocklist": ["1password", "bitwarden", "keepassxc", "incognito", "private browsing"],
+  "blocklistLayers": ["mako", "swaync", "dunst", "rofi", "fuzzel", "wlogout"],
   "blocklistTitles": []
 }
 ```
@@ -195,7 +200,7 @@ Frames and the index live in `~/.local/share/omarchy-hindsight/`.
 python3 tests/test-index.py
 ```
 
-141 offline checks covering the hashing, the blocklist, query sanitising, the
+156 offline checks covering the hashing, the blocklist, query sanitising, the
 search round trip, ring-buffer pruning, age retention, index migration, and the
 frame-vanished-under-the-backfill case — none of which need a screen.
 

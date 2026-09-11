@@ -699,7 +699,7 @@ def sessions(listing, answers):
         return 1, b"", b""
     return fake
 
-os.environ.pop("XDG_SESSION_ID", None)
+_saved_session_id = os.environ.pop("XDG_SESSION_ID", None)
 two = "2 1000 me - 920 manager - no -\n5 1000 me seat0 999 user tty2 no -\n"
 check("a locked session is not masked by the systemd user manager",
       with_run(sessions(two, {"5": "yes", "2": "no"}), hs.session_locked) is True)
@@ -723,28 +723,39 @@ for shape in ("1", None, {"id": None}):
           with_run(hypr(good_mon, bad),
                    lambda: hs.visible_windows("DP-1")) == (False, []))
 
-layers = {"DP-1": {"levels": {"2": [{"namespace": "1password-overlay"}]}}}
+layers = {"DP-1": {"levels": {"2": [{"namespace": "mako"}]}}}
 def layer_run(cmd, **kwargs):
     if cmd[:2] == ["hyprctl", "layers"]:
         return 0, json.dumps(layers).encode(), b""
     return 1, b"", b""
 probed, names = with_run(layer_run, lambda: hs.visible_layers("DP-1"))
-check("layer surfaces are enumerated", probed and names == ["1password-overlay"],
-      names)
-check("a blocked notification overlay is caught",
-      hs.blocked_by(hs.DEFAULTS, "1password-overlay", "") != "")
+check("layer surfaces are enumerated", probed and names == ["mako"], names)
+# A notification daemon names its surface after itself, never after the app
+# that raised the toast, so matching against the app blocklist catches nothing.
+check("a real notification daemon is caught by the layer rules",
+      hs.blocked_layer(hs.DEFAULTS, ["mako"]) != "")
+check("and so are the other common ones",
+      all(hs.blocked_layer(hs.DEFAULTS, [n]) for n in
+          ("swaync", "dunst", "fnott", "rofi", "fuzzel")))
+check("the bar and the wallpaper are not blocked",
+      hs.blocked_layer(hs.DEFAULTS, ["omarchy-bar", "omarchy-background"]) == "")
+check("matching a toast against the app blocklist would catch nothing",
+      hs.blocked_by(hs.DEFAULTS, "mako", "") == "")
+check("a monitor missing from the layer map is not an empty screen",
+      with_run(layer_run, lambda: hs.visible_layers("DP-9")) == (False, []))
 check("an unreadable layer list is not an empty one",
       with_run(lambda *a, **k: (1, b"", b"x"),
                lambda: hs.visible_layers("DP-1")) == (False, []))
 
-check("an infinite interval falls back to the default",
-      hs.load_config.__module__ is not None)
 bad_cfg = dict(hs.DEFAULTS)
 open(os.environ["HINDSIGHT_CONFIG"], "w").write('{"interval": Infinity}')
 check("Infinity in the config cannot stop the recorder",
       hs.load_config()["interval"] == hs.DEFAULTS["interval"],
       hs.load_config()["interval"])
 os.remove(os.environ["HINDSIGHT_CONFIG"])
+
+if _saved_session_id is not None:
+    os.environ["XDG_SESSION_ID"] = _saved_session_id
 
 print("\n-- deletion, repair and OCR must survive a hostile index --")
 poison = hs.connect()
@@ -785,14 +796,112 @@ check("a real frame still does",
 
 fid = hs.store(poison, 6000, os.path.join(pday, "000003-000.webp"),
                "app", "t", "DP-1", 1, 1000)
+hs._ocr_probe.update({"ok": None, "at": 0.0})   # the probe is cached now
 with_run(lambda *a, **k: (127, b"", b"missing"),
          lambda: hs.note_ocr_failure(poison, fid))
+hs._ocr_probe.update({"ok": None, "at": 0.0})
 check("a frame captured without tesseract stays queued for retry",
       poison.execute("SELECT ocr FROM frames WHERE id=?",
                      (fid,)).fetchone()[0] == hs.OCR_TOOL_MISSING)
 check("tesseract failing is not the same as a blank screen",
       with_run(lambda *a, **k: (127, b"", b""),
                lambda: hs.ocr_text(b"x", 5)) is None)
+
+print("\n-- the fixes must converge, not merely act --")
+conv = hs.connect()
+cday = os.path.join(hs.FRAMES, "2018-03-03")
+os.makedirs(cday, exist_ok=True)
+for i in range(50):
+    fp = os.path.join(cday, "%06d-000.webp" % i)
+    open(fp, "wb").write(b"c" * 1000)
+    hs.store(conv, 300 + i, fp, "app", "t", "DP-1", i, 1000)
+conv.execute("UPDATE frames SET bytes=? WHERE path LIKE ?",
+             (hs.MAX_FRAME_BYTES, cday + "%"))
+conv.commit()
+wide = dict(hs.DEFAULTS); wide["budgetMB"] = 4096; wide["retentionDays"] = 0
+kept_before = conv.execute("SELECT COUNT(*) FROM frames WHERE path LIKE ?",
+                           (cday + "%",)).fetchone()[0]
+hs.prune(conv, wide)
+lied = conv.execute("SELECT COUNT(*) FROM frames WHERE bytes=? AND path LIKE ?",
+                    (hs.MAX_FRAME_BYTES, cday + "%")).fetchone()[0]
+check("a lying size column is corrected from disk rather than obeyed",
+      lied == 0, lied)
+check("and nothing was deleted to achieve it",
+      conv.execute("SELECT COUNT(*) FROM frames WHERE path LIKE ?",
+                   (cday + "%",)).fetchone()[0] == kept_before)
+
+spawned = []
+def counting(cmd, **kwargs):
+    spawned.append(" ".join(cmd))
+    return 127, b"", b"gone"
+hs._ocr_probe.update({"ok": None, "at": 0.0})
+spinner = hs.Recorder.__new__(hs.Recorder)
+spinner.cfg = dict(hs.DEFAULTS)
+fid = hs.store(conv, 400, os.path.join(cday, "000009-000.webp"),
+               "app", "t", "DP-1", 1, 1000)
+conv.execute("UPDATE frames SET ocr=? WHERE id=?", (hs.OCR_TOOL_MISSING, fid))
+conv.commit()
+hs.run = counting
+try:
+    for _ in range(5):
+        spinner.backfill(conv)
+finally:
+    hs.run = real_run
+    hs._ocr_probe.update({"ok": None, "at": 0.0})
+# Other frames legitimately still need reading, so the measure is how often
+# backfill re-asks whether the tool exists, not how many processes run.
+probes = [cmd for cmd in spawned if cmd.startswith("tesseract --version")]
+check("the tesseract probe is cached rather than run every pass",
+      len(probes) <= 1, "%d probes over 5 passes" % len(probes))
+check("a frame marked tool-missing is not retried while the tool is missing",
+      conv.execute("SELECT ocr FROM frames WHERE id=?",
+                   (fid,)).fetchone()[0] == hs.OCR_TOOL_MISSING)
+
+print("\n-- pause must not claim what it did not do --")
+import io as _io, contextlib as _ctx
+if os.path.lexists(hs.PAUSE_MARKER):
+    os.remove(hs.PAUSE_MARKER)
+os.symlink(os.path.join(TMP, "no", "such", "place"), hs.PAUSE_MARKER)
+_buf = _io.StringIO()
+with _ctx.redirect_stdout(_buf):
+    rc = hs.set_paused(True)
+check("a pause that could not be written reports failure", rc == 1, rc)
+check("and reports the state the marker is actually in",
+      '"paused": false' in _buf.getvalue(), _buf.getvalue().strip())
+os.remove(hs.PAUSE_MARKER)
+_buf = _io.StringIO()
+with _ctx.redirect_stdout(_buf):
+    rc = hs.set_paused(True)
+check("a pause that worked still reports success",
+      rc == 0 and '"paused": true' in _buf.getvalue(), _buf.getvalue().strip())
+hs.set_paused(False)
+
+print("\n-- session classes --")
+def greeter(cmd, **kwargs):
+    if cmd[0] == "pgrep":
+        return 1, b"", b""
+    if cmd[:2] == ["loginctl", "list-sessions"]:
+        return 0, b"7 1000 me seat0 900 greeter tty1 no -\n", b""
+    if cmd[:2] == ["loginctl", "show-session"]:
+        return (0, b"yes", b"") if cmd[2] == "7" else (1, b"", b"")
+    return 1, b"", b""
+_had = os.environ.pop("XDG_SESSION_ID", None)
+check("a greeter session is asked, not discarded",
+      with_run(greeter, hs.session_locked) is True)
+if _had is not None:
+    os.environ["XDG_SESSION_ID"] = _had
+
+print("\n-- the index and its sidecars are all private --")
+sidecar = hs.connect()
+sidecar.execute("CREATE TABLE IF NOT EXISTS touch(x)")
+sidecar.execute("INSERT INTO touch VALUES(1)")
+sidecar.commit()
+present = [s for s in ("", "-wal", "-shm") if os.path.exists(hs.DB_PATH + s)]
+check("the WAL exists to be checked at all", "-wal" in present, present)
+for suffix in present:
+    check("the index%s is private" % (suffix or ""),
+          (os.stat(hs.DB_PATH + suffix).st_mode & 0o777) == 0o600,
+          oct(os.stat(hs.DB_PATH + suffix).st_mode & 0o777))
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 if FAIL:

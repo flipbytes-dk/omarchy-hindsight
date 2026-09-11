@@ -56,6 +56,15 @@ DEFAULTS = {
         # disk and, because its few words score highly, poisons search.
         "screensaver", "org.omarchy.screensaver",
     ],
+    # Layer-shell surfaces are matched by namespace, and a notification
+    # daemon names its surface after itself rather than after whatever raised
+    # the notification. Blocking on "1password" can never catch a 1Password
+    # toast, so the daemons are named directly: a frame is skipped while any
+    # notification is on screen, because the code in it is not ours to judge.
+    "blocklistLayers": [
+        "mako", "swaync", "dunst", "fnott", "notifications",
+        "wlogout", "rofi", "fuzzel", "wofi", "anyrun",
+    ],
     "blocklistTitles": [],
 }
 
@@ -574,8 +583,11 @@ def connect():
     ensure_dirs()
     check_db_path()
     conn = sqlite3.connect(DB_PATH, timeout=15)
-    secure_db_files()
     conn.execute("PRAGMA journal_mode=WAL")
+    # After the pragma, not before: the -wal and -shm files do not exist
+    # until it runs, so securing them first was a no-op on a fresh database
+    # and the README's claim about the WAL rested entirely on the umask.
+    secure_db_files()
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS frames(
@@ -826,6 +838,10 @@ def visible_windows(monitor_name):
     return True, shown
 
 
+NEVER_LOCKED_CLASSES = frozenset((
+    "manager", "manager-early", "background", "background-light"))
+
+
 def login_sessions():
     """Session ids worth asking about the lock state.
 
@@ -844,8 +860,11 @@ def login_sessions():
             fields = line.split()
             if len(fields) < 2 or fields[1] != mine:
                 continue
-            # CLASS column: keep real login sessions, drop "manager".
-            if len(fields) >= 6 and fields[5] != "user":
+            # CLASS column, on systemd versions that print one. Drop only
+            # the classes that can never hold a lock; "greeter",
+            # "user-early" and "user-incomplete" are real sessions and an
+            # exact match on "user" discarded them.
+            if len(fields) >= 6 and fields[5] in NEVER_LOCKED_CLASSES:
                 continue
             if fields[0] not in ids:
                 ids.append(fields[0])
@@ -869,9 +888,11 @@ def visible_layers(monitor_name):
     if not isinstance(data, dict):
         return False, []
     names = []
+    found = not monitor_name
     for output, body in data.items():
         if monitor_name and output != monitor_name:
             continue
+        found = True
         if not isinstance(body, dict):
             return False, []
         levels = body.get("levels")
@@ -884,6 +905,10 @@ def visible_layers(monitor_name):
                 if not isinstance(surface, dict):
                     return False, []
                 names.append(str(surface.get("namespace") or ""))
+    if not found:
+        # The same shape visible_windows() fails closed on. An output that is
+        # not in the layers map is an output we know nothing about.
+        return False, []
     return True, names
 
 
@@ -922,6 +947,24 @@ def session_locked():
     # Knowing that a handful of named lockers are absent is not the same as
     # knowing the session is unlocked; only an explicit "no" is.
     return None
+
+
+def blocked_layer(cfg, namespaces):
+    """Return the matching layer rule, or ''.
+
+    Matched against blocklistLayers rather than blocklist, because the two
+    name different things: one is an application, the other is whichever
+    daemon drew the surface."""
+    rules = cfg.get("blocklistLayers")
+    if rules is None:
+        rules = DEFAULTS["blocklistLayers"]
+    for namespace in namespaces or []:
+        hay = str(namespace or "").lower()
+        for needle in rules:
+            token = str(needle).lower().strip()
+            if token and token in hay:
+                return str(needle)
+    return ""
 
 
 def blocked_by(cfg, app, title):
@@ -988,11 +1031,6 @@ def ocr_frame_file(path, timeout):
     return ocr_text(ppm, timeout)
 
 
-def ocr_available():
-    code, _, _ = run(["tesseract", "--version"], timeout=5)
-    return code == 0
-
-
 def ocr_text(ppm, timeout):
     code, out, _ = run(["nice", "-n", "19", "tesseract", "-", "stdout",
                         "--psm", "6"], timeout=timeout, stdin_bytes=ppm)
@@ -1030,6 +1068,24 @@ def store(conn, ts, path, app, title, monitor, hash_bits, size):
         (ts, day, path, app, title, monitor, str(hash_bits), size))
     conn.commit()
     return cur.lastrowid
+
+
+_ocr_probe = {"ok": None, "at": 0.0}
+OCR_PROBE_INTERVAL = 300.0
+
+
+def ocr_available(force=False):
+    """Is tesseract usable? Cached, because this used to be asked once per
+    failed frame, which on a machine without tesseract meant three process
+    spawns every half second, for ever."""
+    now = time.time()
+    if (not force and _ocr_probe["ok"] is not None
+            and now - _ocr_probe["at"] < OCR_PROBE_INTERVAL):
+        return _ocr_probe["ok"]
+    code, _, _ = run(["tesseract", "--version"], timeout=5)
+    _ocr_probe["ok"] = (code == 0)
+    _ocr_probe["at"] = now
+    return _ocr_probe["ok"]
 
 
 def note_ocr_failure(conn, frame_id):
@@ -1133,6 +1189,20 @@ def prune(conn, cfg):
         # value, and the loop walks oldest-first.
         rows = conn.execute("SELECT id,path,bytes FROM frames ORDER BY ts").fetchall()
         real = [(fid, path, disk_size(path, size)) for fid, path, size in rows]
+
+        # Write the measured sizes back. Without this the cheap column check
+        # above stays over budget for ever while the measured total is under
+        # it: prune would walk the whole archive on every tick, delete
+        # nothing, and never converge. Repairing the column ends that after
+        # one pass, and leaves the panel showing a true figure.
+        corrections = [(size, fid) for (fid, _, size), (_, _, was)
+                       in zip(real, rows) if size != was]
+        if corrections:
+            log("index reported %d frame size(s) wrongly; corrected from disk"
+                % len(corrections))
+            conn.executemany("UPDATE frames SET bytes=? WHERE id=?", corrections)
+            conn.commit()
+
         running = sum(size for _, _, size in real)
         doomed = []
         for frame_id, path, size in real:
@@ -1147,13 +1217,25 @@ def prune(conn, cfg):
 
 
 def empty_dirs():
+    """Drop day directories that pruning has emptied.
+
+    The try used to wrap the whole loop, so one entry that could not be
+    removed - a symlink, which os.path.isdir follows but os.rmdir refuses -
+    stranded every day directory after it in listdir order."""
     try:
-        for day in os.listdir(FRAMES):
-            path = os.path.join(FRAMES, day)
-            if os.path.isdir(path) and not os.listdir(path):
-                os.rmdir(path)
+        names = os.listdir(FRAMES)
     except OSError:
-        pass
+        return
+    for day in names:
+        path = os.path.join(FRAMES, day)
+        try:
+            info = os.lstat(path)
+            if not statmod.S_ISDIR(info.st_mode):
+                continue          # a link is not a day directory of ours
+            if not os.listdir(path):
+                os.rmdir(path)
+        except OSError:
+            continue
 
 
 def disk_size(path, recorded):
@@ -1177,9 +1259,7 @@ def frame_bytes(value):
     """A frame's size, clamped to something a frame could actually be.
 
     The column is written by this program but read back from a file anyone
-    with the user's account can edit. One inflated row used to make prune
-    believe the archive was terabytes over budget and delete every frame in
-    it."""
+    with the user's account can edit."""
     try:
         size = int(value or 0)
     except (TypeError, ValueError):
@@ -1426,10 +1506,15 @@ class Recorder:
     def backfill(self, conn):
         if not self.cfg.get("ocr"):
             return
+        # Frames captured while tesseract was missing are only worth
+        # re-reading once it is back. Asking that question is itself a
+        # process spawn, so it is cached and only refreshed occasionally.
+        retry_missing = ocr_available()
         row = conn.execute(
             "SELECT id,path,app,title FROM frames WHERE ocr IN (?,?)"
             " ORDER BY ts DESC LIMIT 1",
-            (OCR_PENDING, OCR_TOOL_MISSING)).fetchone()
+            (OCR_PENDING, OCR_TOOL_MISSING if retry_missing else OCR_PENDING)
+        ).fetchone()
         if not row:
             return
         frame_id, path, app, title = row
@@ -1567,11 +1652,12 @@ class Recorder:
             return
 
         rule = ""
-        for other_app, other_title in (windows + [(app, title)]
-                                       + [(name, "") for name in layers]):
+        for other_app, other_title in windows + [(app, title)]:
             rule = blocked_by(self.cfg, other_app, other_title)
             if rule:
                 break
+        if not rule:
+            rule = blocked_layer(self.cfg, layers)
         if rule:
             # The frame is never taken. Nothing to delete later, because
             # nothing existed.
@@ -1820,6 +1906,12 @@ def cmd_status(_args):
 
 
 def set_paused(paused):
+    """Report the state the marker is actually in, not the one asked for.
+
+    Printing the requested state regardless meant a failed write (a dangling
+    symlink at the marker, a full disk) produced {"paused": true} while
+    capture carried on, and the bar showed the paused glyph over a recording
+    session."""
     ensure_dirs()
     if paused:
         write_private(PAUSE_MARKER, str(time.time()))
@@ -1828,7 +1920,15 @@ def set_paused(paused):
             os.remove(PAUSE_MARKER)
         except FileNotFoundError:
             pass
-    print(json.dumps({"paused": paused}))
+        except OSError as exc:
+            log("could not clear the pause marker (%s)" % exc)
+    actual = os.path.exists(PAUSE_MARKER)
+    print(json.dumps({"paused": actual}))
+    if actual != paused:
+        log("could not %s: the pause marker is still %s"
+            % ("pause" if paused else "resume",
+               "set" if actual else "absent"))
+        return 1
     return 0
 
 
