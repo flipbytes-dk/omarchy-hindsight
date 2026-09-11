@@ -1325,9 +1325,16 @@ io.open(outside, "wb").write(b"keep me")
 link = os.path.join(orphan_day, "130000-000.webp")
 os.symlink(outside, link)
 os.utime(link, (old_time, old_time), follow_symlinks=False)
-hs.sweep_orphans(conn_o)
+swept_link = hs.sweep_orphans(conn_o)
 check("the sweep does not follow a symlink out of the archive",
       os.path.exists(outside), outside)
+# It also has to admit it removed nothing. Counting the refusal made prune
+# call empty_dirs() and drop the cached archive size on every sweep, for as
+# long as the symlink sat there.
+check("and reports no removal for the file it refused", swept_link == 0,
+      swept_link)
+check("so a refused file does not keep re-triggering the sweep",
+      hs.sweep_orphans(conn_o) == 0 and os.path.lexists(link))
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 if FAIL:

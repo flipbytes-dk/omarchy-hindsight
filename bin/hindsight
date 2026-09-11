@@ -1349,7 +1349,13 @@ def sweep_orphans(conn, grace=120.0):
             # Same guarded deletion the index-driven path uses: descends the
             # archive one component at a time and refuses anything that is
             # not a regular file of ours inside it.
-            if unlink_frame(path):
+            # unlink_frame() answers "the row may go", which is not the
+            # same as "the file is gone": it says yes after refusing a
+            # symlink, because the row behind one is worth dropping. There
+            # is no row here, so a refusal left the file in place while the
+            # count claimed otherwise, and prune re-measured the whole
+            # archive every five minutes for as long as the process lived.
+            if unlink_frame(path) and not os.path.lexists(path):
                 removed += 1
     if removed:
         log("removed %d frame(s) on disk that the index did not know about"
