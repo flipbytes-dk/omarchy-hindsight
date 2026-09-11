@@ -89,8 +89,9 @@ regex_cfg["blocklistTitles"] = [r"acct[-_]\d{4}"]
 check("honours a title regex", hs.blocked_by(regex_cfg, "ghostty", "acct_9931 ledger") == r"acct[-_]\d{4}")
 broken = dict(hs.DEFAULTS)
 broken["blocklistTitles"] = ["(unclosed"]
-check("survives an invalid regex instead of crashing",
-      hs.blocked_by(broken, "ghostty", "anything") == "")
+check("an unusable regex blocks rather than being silently discarded",
+      hs.blocked_by(broken, "ghostty", "anything") != "",
+      hs.blocked_by(broken, "ghostty", "anything"))
 
 print("\n-- query sanitising: people type punctuation, FTS5 treats it as syntax --")
 check("quotes words, matching long ones as prefixes",
@@ -459,9 +460,16 @@ def answered_no(cmd, **kwargs):
     if cmd[0] == "pgrep":
         return 1, b"", b""          # no locker running: a real answer
     return 2, b"", b"loginctl gone"
-check("a locker that is definitely absent counts as unlocked",
-      with_run(answered_no, hs.session_locked) is False,
+check("no named locker plus no loginctl answer is still unknown",
+      with_run(answered_no, hs.session_locked) is None,
       with_run(answered_no, hs.session_locked))
+
+def says_unlocked(cmd, **kwargs):
+    if cmd[0] == "pgrep":
+        return 1, b"", b""
+    return 0, b"no", b""
+check("only an explicit loginctl 'no' means unlocked",
+      with_run(says_unlocked, hs.session_locked) is False)
 
 def says_locked(cmd, **kwargs):
     if cmd[0] == "pgrep":
@@ -562,12 +570,38 @@ cfg_link = os.path.join(TMP, "config-link.json")
 if os.path.lexists(cfg_link):
     os.remove(cfg_link)
 os.symlink(bait, cfg_link)
-check("a symlinked config is ignored", hs.read_private(cfg_link) is None)
+def raises_unreadable(path):
+    try:
+        hs.read_private(path)
+        return False
+    except hs.Unreadable:
+        return True
+
+check("a symlinked config is refused, not silently ignored",
+      raises_unreadable(cfg_link))
 
 huge = os.path.join(TMP, "huge.json")
 with open(huge, "w") as fh:
     fh.write("{}" + " " * (hs.MAX_TEXT_BYTES + 10))
-check("an oversized config is ignored", hs.read_private(huge) is None)
+check("an oversized config is refused", raises_unreadable(huge))
+check("a missing file is None, which is not the same thing",
+      hs.read_private(os.path.join(TMP, "no-such-file")) is None)
+
+# The dotfiles case: a config symlinked elsewhere must survive a settings write.
+real_cfg = os.path.join(TMP, "dotfiles-config.json")
+open(real_cfg, "w").write('{"blocklist": ["my-bank"], "interval": 8.0}')
+saved_cfg = os.environ["HINDSIGHT_CONFIG"]
+try:
+    os.remove(hs.CONFIG)
+except OSError:
+    pass
+os.symlink(real_cfg, hs.CONFIG)
+check("a settings write refuses to replace a config it cannot read",
+      hs.save_config({"budgetMB": 2048}) is None)
+check("and the symlink is still a symlink", os.path.islink(hs.CONFIG))
+check("and the real file still holds the user's rules",
+      "my-bank" in open(real_cfg).read())
+os.remove(hs.CONFIG)
 
 small = os.path.join(TMP, "small.json")
 open(small, "w").write('{"ok": true}')

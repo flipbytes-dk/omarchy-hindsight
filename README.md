@@ -134,6 +134,10 @@ This plugin exists to remember your screen, so it is built to be told no.
   that is genuinely inside it, so a tampered database cannot turn pruning
   into a way to delete your files. Config and state are read no-follow and
   size-bounded.
+- **The whole screen is checked, not just the focused window.** A capture
+  takes the entire output, so every window sharing it has to clear the
+  blocklist. A blocked app tiled beside the one you are using stops the
+  frame.
 - **Every check fails closed.** If the compositor cannot say which window is
   focused, or whether the session is locked, or whether the screen is on, the
   frame is not taken. A blocklist is worth no more than the probe behind it,
@@ -191,7 +195,7 @@ Frames and the index live in `~/.local/share/omarchy-hindsight/`.
 python3 tests/test-index.py
 ```
 
-41 offline checks covering the hashing, the blocklist, query sanitising, the
+116 offline checks covering the hashing, the blocklist, query sanitising, the
 search round trip, ring-buffer pruning, age retention, index migration, and the
 frame-vanished-under-the-backfill case — none of which need a screen.
 

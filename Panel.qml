@@ -106,6 +106,7 @@ Panel {
           spacing: Style.space(8)
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width - pauseButton.width - Style.space(8)
             color: Color.foreground
             font.family: Style.font.family
@@ -159,6 +160,7 @@ Panel {
 
         // -- results --------------------------------------------------------
         Text {
+          textFormat: Text.PlainText
           width: parent.width
           visible: searchBox.text.length > 0 && !root.searching && root.results.length === 0
           color: Color.foreground
@@ -172,6 +174,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           width: parent.width
           visible: searchBox.text.length === 0
           color: Color.foreground
@@ -223,7 +226,18 @@ Panel {
                 fillMode: Image.PreserveAspectCrop
                 asynchronous: true
                 cache: false
-                source: modelData.path ? "file://" + modelData.path : ""
+                // Built per path segment rather than concatenated: Qt
+                // percent-decodes a file URL, so a raw "%2e%2e" in a stored
+                // path would climb out of the archive, and an ordinary "#"
+                // in a home directory would break every thumbnail.
+                source: {
+                  if (!modelData.path) return ""
+                  var parts = String(modelData.path).split("/")
+                  var encoded = []
+                  for (var i = 0; i < parts.length; i++)
+                    encoded.push(encodeURIComponent(parts[i]))
+                  return "file://" + encoded.join("/")
+                }
                 sourceSize.width: Style.space(128)
               }
 
@@ -232,6 +246,7 @@ Panel {
                 spacing: Style.space(2)
 
                 Text {
+                  textFormat: Text.PlainText
                   width: parent.width
                   color: Color.foreground
                   opacity: 0.65
@@ -242,6 +257,7 @@ Panel {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   width: parent.width
                   color: Color.foreground
                   font.family: Style.font.family
@@ -266,6 +282,7 @@ Panel {
           spacing: Style.space(8)
 
           Text {
+            textFormat: Text.PlainText
             id: coverageLine
             width: parent.width - storageButton.width - Style.space(8)
             color: Color.foreground
@@ -296,6 +313,7 @@ Panel {
           visible: root.showStorage
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             color: Color.foreground
             opacity: 0.6
@@ -327,6 +345,7 @@ Panel {
                 opacity: chip.current ? 1.0 : 0.45
 
                 Text {
+                  textFormat: Text.PlainText
                   id: chipLabel
                   anchors.centerIn: parent
                   color: chip.current ? Color.background : Color.foreground
@@ -347,6 +366,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             id: hint
             width: parent.width
             color: Color.foreground
@@ -366,6 +386,7 @@ Panel {
           visible: root.frames > 0
 
           Text {
+            textFormat: Text.PlainText
             color: Color.foreground
             opacity: 0.6
             font.family: Style.font.family

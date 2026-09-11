@@ -80,24 +80,47 @@ OCR_QUEUE_MAX = 8    # bounded: OCR is ~1.5s, capture is ~40ms; drop, never lag
 # config + paths
 
 
+def config_stamp():
+    """Something cheap that changes when the config does."""
+    try:
+        info = os.stat(CONFIG)
+        return (info.st_mtime_ns, info.st_size, info.st_ino)
+    except OSError:
+        return None
+
+
 def load_config():
     cfg = dict(DEFAULTS)
     try:
         raw = read_private(CONFIG)
-        if raw is None:
-            raise FileNotFoundError(CONFIG)
-        user = json.loads(raw)
-        if isinstance(user, dict):
-            for key, value in user.items():
-                if key in cfg and value is not None:
-                    cfg[key] = value
-    except FileNotFoundError:
-        pass
+        if raw is not None:
+            user = json.loads(raw)
+            if isinstance(user, dict):
+                for key, value in user.items():
+                    if key in cfg and value is not None:
+                        cfg[key] = value
+    except Unreadable as exc:
+        # Loud, because the alternative is a user whose blocklist quietly
+        # never applied.
+        log("cannot read your config (%s); running on defaults, and your "
+            "blocklist is NOT in effect" % exc)
     except Exception as exc:
         log("config unreadable (%s), using defaults" % exc)
-    cfg["interval"] = max(1.0, float(cfg["interval"]))
-    cfg["changeBits"] = max(0, int(cfg["changeBits"]))
-    cfg["budgetMB"] = max(64, int(cfg["budgetMB"]))
+    # These coercions used to sit outside the try above, so "interval": "fast"
+    # raised on every invocation and Service.qml respawned the recorder every
+    # two seconds forever. A bad value falls back to the default and says so.
+    for key, floor, cast in (("interval", 1.0, float),
+                             ("changeBits", 0, int),
+                             ("budgetMB", 64, int),
+                             ("quality", 1, int),
+                             ("ocrTimeout", 1, int)):
+        try:
+            cfg[key] = max(floor, cast(cfg[key]))
+        except (TypeError, ValueError, OverflowError):
+            log("config value for %s (%r) is not usable; using %r"
+                % (key, cfg[key], DEFAULTS[key]))
+            cfg[key] = DEFAULTS[key]
+    cfg["quality"] = min(100, cfg["quality"])
     return cfg
 
 
@@ -108,6 +131,42 @@ def log(message):
 
 MAX_ARCHIVE_DEPTH = 8         # frames live two levels down; this is slack, not a limit to use
 MAX_FRAME_BYTES = 64 * 1024 * 1024
+
+
+SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def open_archive():
+    """Open the frames directory without resolving either it or its parent
+    by name.
+
+    Anchoring at os.open(FRAMES) still resolved the archive root as a
+    pathname, so replacing the data directory with a symlink redirected
+    every write, read and delete below it. DATA is opened with O_NOFOLLOW
+    and "frames" is opened relative to that descriptor."""
+    data_fd = None
+    try:
+        data_fd = os.open(DATA, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        info = os.fstat(data_fd)
+        if info.st_uid != os.getuid() or not statmod.S_ISDIR(info.st_mode):
+            log("refusing to use %s: not a directory of ours" % DATA)
+            return None
+        fd = os.open("frames", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                     dir_fd=data_fd)
+        info = os.fstat(fd)
+        if info.st_uid != os.getuid() or not statmod.S_ISDIR(info.st_mode):
+            os.close(fd)
+            log("refusing to use the frames directory: not ours")
+            return None
+        return fd
+    except OSError:
+        return None
+    finally:
+        if data_fd is not None:
+            try:
+                os.close(data_fd)
+            except OSError:
+                pass
 
 
 def archive_descend(path):
@@ -127,21 +186,28 @@ def archive_descend(path):
     except ValueError:
         return None, "outside the archive"
     parts = rel.split(os.sep)
-    if os.path.isabs(rel) or any(part in ("", ".", "..") for part in parts):
+    if os.path.isabs(rel) or len(parts) > MAX_ARCHIVE_DEPTH:
         return None, "outside the archive"
-    if len(parts) > MAX_ARCHIVE_DEPTH:
-        return None, "nested deeper than the archive ever goes"
+    # Frames are named by this program and never contain anything but letters,
+    # digits, dot, dash and underscore. Insisting on that rejects traversal,
+    # percent escapes that Qt would later decode, and embedded NUL bytes,
+    # which raise ValueError rather than OSError and escaped every guard.
+    # The character class alone is not enough: ".." is made entirely of
+    # characters it allows, so traversal has to be rejected by name too.
+    if any(part in (".", "..") for part in parts):
+        return None, "outside the archive"
+    if not all(SAFE_COMPONENT.match(part) for part in parts):
+        return None, "not a name this program writes"
 
-    fds = []
-    try:
-        fds.append(os.open(FRAMES, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW))
-    except OSError as exc:
-        return None, "archive unavailable: %s" % exc
+    root = open_archive()
+    if root is None:
+        return None, "archive unavailable"
+    fds = [root]
     for part in parts[:-1]:
         try:
             fds.append(os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                                dir_fd=fds[-1]))
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             close_fds(fds)
             return None, str(exc)
     return fds, parts[-1]
@@ -161,31 +227,48 @@ def open_day_dir(day):
     If something has replaced today's directory with a symlink, opening it
     with O_NOFOLLOW fails and no frame is written, which is the right
     outcome: a missing frame beats a frame written somewhere else."""
-    root = None
+    if day in (".", "..") or not SAFE_COMPONENT.match(day):
+        log("refusing to use %r as a day directory" % day)
+        return None
+    root = open_archive()
+    if root is None:
+        # The archive can disappear under a running recorder: somebody
+        # follows the README's removal step without disabling the plugin
+        # first. Recreate it rather than wedging capture until next login.
+        ensure_dirs()
+        root = open_archive()
+    if root is None:
+        log("cannot open the archive")
+        return None
+    fd = None
     try:
-        root = os.open(FRAMES, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             os.mkdir(day, DIR_MODE, dir_fd=root)
         except FileExistsError:
             pass
-        fd = os.open(day, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root)
+        fd = os.open(day, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                     dir_fd=root)
         info = os.fstat(fd)
         if info.st_uid != os.getuid() or not statmod.S_ISDIR(info.st_mode):
-            os.close(fd)
             log("refusing to use %s: not a directory of ours" % day)
+            os.close(fd)
             return None
         if (info.st_mode & 0o777) != DIR_MODE:
             os.fchmod(fd, DIR_MODE)
         return fd
     except OSError as exc:
         log("cannot open the day directory %s (%s)" % (day, exc))
-        return None
-    finally:
-        if root is not None:
+        if fd is not None:
             try:
-                os.close(root)
+                os.close(fd)
             except OSError:
                 pass
+        return None
+    finally:
+        try:
+            os.close(root)
+        except OSError:
+            pass
 
 
 def read_frame_bytes(path, limit=MAX_FRAME_BYTES):
@@ -230,6 +313,12 @@ def read_frame_bytes(path, limit=MAX_FRAME_BYTES):
 MAX_TEXT_BYTES = 256 * 1024   # config and state are small; anything larger is not ours
 
 
+class Unreadable(Exception):
+    """The file is there but this refused to read it. Not the same as absent:
+    treating the two alike let a symlinked config silently fall back to
+    defaults, and the next write replaced the user's real file."""
+
+
 def read_private(path, limit=MAX_TEXT_BYTES):
     """Read a small file of ours, refusing links, odd types and runaway size.
 
@@ -240,11 +329,9 @@ def read_private(path, limit=MAX_TEXT_BYTES):
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         info = os.fstat(fd)
         if not statmod.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
-            log("ignoring %s: not a regular file of ours" % path)
-            return None
+            raise Unreadable("%s is not a regular file of ours" % path)
         if info.st_size > limit:
-            log("ignoring %s: larger than %d bytes" % (path, limit))
-            return None
+            raise Unreadable("%s is larger than %d bytes" % (path, limit))
         chunks = []
         total = 0
         while total <= limit:
@@ -254,11 +341,12 @@ def read_private(path, limit=MAX_TEXT_BYTES):
             chunks.append(chunk)
             total += len(chunk)
         if total > limit:
-            log("ignoring %s: larger than %d bytes" % (path, limit))
-            return None
+            raise Unreadable("%s is larger than %d bytes" % (path, limit))
         return b"".join(chunks).decode("utf-8", "replace")
-    except OSError:
+    except FileNotFoundError:
         return None
+    except OSError as exc:
+        raise Unreadable("%s could not be read (%s)" % (path, exc))
     finally:
         if fd is not None:
             try:
@@ -599,7 +687,11 @@ def active_window():
         data = json.loads(raw)
     except Exception:
         return False, "", ""
-    if not isinstance(data, dict):
+    if not isinstance(data, dict) or "class" not in data:
+        # hyprctl answers {} whenever the focused surface is not a toplevel:
+        # a launcher, a polkit prompt, an OSD, a lock surface, the
+        # screensaver. Those are exactly the moments the blocklist exists
+        # for, so an unidentifiable surface is not permission to capture.
         return False, "", ""
     return True, str(data.get("class") or ""), str(data.get("title") or "")
 
@@ -629,28 +721,111 @@ def focused_monitor():
     return True, str(chosen.get("name") or "") or None, awake
 
 
+def visible_windows(monitor_name):
+    """(probed, [(app, title), ...]) for everything shown on one output.
+
+    grim captures a whole output, so checking only the focused window was
+    never enough: on a tiling compositor a password manager tiled beside the
+    terminal lands in the frame in full. Every window sharing the visible
+    workspaces of this output has to clear the blocklist."""
+    code, out, _ = run(["hyprctl", "monitors", "-j"], timeout=3)
+    if code != 0:
+        return False, []
+    try:
+        monitors = json.loads(out.decode("utf-8", "replace") or "[]")
+    except Exception:
+        return False, []
+    if not isinstance(monitors, list):
+        return False, []
+
+    visible = set()
+    found = False
+    for mon in monitors:
+        if not isinstance(mon, dict):
+            return False, []
+        if monitor_name and str(mon.get("name") or "") != monitor_name:
+            continue
+        found = True
+        for key in ("activeWorkspace", "specialWorkspace"):
+            space = mon.get(key)
+            if isinstance(space, dict) and space.get("id") is not None:
+                visible.add(space.get("id"))
+    if not found:
+        # No monitor by that name: better to stop than to guess which
+        # workspaces are on screen.
+        return False, []
+
+    code, out, _ = run(["hyprctl", "clients", "-j"], timeout=3)
+    if code != 0:
+        return False, []
+    try:
+        clients = json.loads(out.decode("utf-8", "replace") or "[]")
+    except Exception:
+        return False, []
+    if not isinstance(clients, list):
+        return False, []
+
+    shown = []
+    for client in clients:
+        if not isinstance(client, dict):
+            return False, []
+        space = client.get("workspace")
+        space_id = space.get("id") if isinstance(space, dict) else None
+        if space_id not in visible:
+            continue
+        if client.get("mapped") is False or client.get("hidden") is True:
+            continue
+        shown.append((str(client.get("class") or ""),
+                      str(client.get("title") or "")))
+    return True, shown
+
+
+def login_sessions():
+    """Session ids worth asking about the lock state, best first."""
+    ids = []
+    from_env = os.environ.get("XDG_SESSION_ID")
+    if from_env:
+        ids.append(from_env)
+    ids.append("self")
+    code, out, _ = run(["loginctl", "list-sessions", "--no-legend"], timeout=3)
+    if code == 0:
+        mine = str(os.getuid())
+        for line in out.decode("utf-8", "replace").splitlines():
+            fields = line.split()
+            if len(fields) >= 2 and fields[1] == mine and fields[0] not in ids:
+                ids.append(fields[0])
+    return ids
+
+
 def session_locked():
     """True, False, or None when neither probe could answer.
 
     None is not the same as unlocked. An unanswered question about whether
     the screen is locked is not permission to record it."""
-    answered = False
     # run() rather than subprocess.run(): a missing pgrep used to raise here
     # and take the recorder down with it.
-    code, _, _ = run(["pgrep", "-x", "hyprlock"], timeout=3)
-    if code == 0:
-        return True
-    if code == 1:
-        answered = True     # pgrep ran and found no locker
-    code, out, _ = run(["loginctl", "show-session", "self",
-                        "-p", "LockedHint", "--value"], timeout=3)
-    if code == 0:
-        hint = out.decode("utf-8", "replace").strip()
+    for locker in ("hyprlock", "swaylock", "gtklock", "waylock"):
+        code, _, _ = run(["pgrep", "-x", locker], timeout=3)
+        if code == 0:
+            return True
+    # "self" fails outright when the process is not inside a session scope,
+    # which is the normal case for something started by the shell. Measured:
+    # `loginctl show-session self` exits 1 with "Caller does not belong to any
+    # known session", so asking only that way made the lock state permanently
+    # unknown and, with the fail-closed rule, stopped capture for good.
+    for session in login_sessions():
+        code, out, _ = run(["loginctl", "show-session", session,
+                            "-p", "LockedHint", "--value"], timeout=3)
+        if code != 0:
+            continue
+        hint = out.decode("utf-8", "replace").strip().lower()
         if hint == "yes":
             return True
         if hint == "no":
             return False
-    return False if answered else None
+    # Knowing that a handful of named lockers are absent is not the same as
+    # knowing the session is unlocked; only an explicit "no" is.
+    return None
 
 
 def blocked_by(cfg, app, title):
@@ -665,8 +840,14 @@ def blocked_by(cfg, app, title):
         try:
             if re.search(str(pattern), title or "", re.I):
                 return str(pattern)
-        except re.error:
-            continue
+        except re.error as exc:
+            # A rule the user wrote to protect something, silently discarded,
+            # is worse than no rule: they believe they are covered. Treat it
+            # as matching and complain, rather than capturing anyway.
+            log("blocklistTitles pattern %r is not a valid regular "
+                "expression (%s); blocking capture until it is fixed"
+                % (pattern, exc))
+            return str(pattern)
     return ""
 
 
@@ -822,7 +1003,7 @@ def prune(conn, cfg):
     # The index counts too, but it must never eat the whole budget: leave at
     # least half for frames so a fat index cannot prune the archive to nothing.
     room = max(budget // 2, budget - index_bytes())
-    total = conn.execute("SELECT COALESCE(SUM(bytes),0) FROM frames").fetchone()[0]
+    total = usage(conn)[1]
     budget = room
     if total > budget:
         # Materialise the candidates first: deleting rows from under a live
@@ -835,7 +1016,7 @@ def prune(conn, cfg):
             if running <= budget:
                 break
             doomed.append((frame_id, path))
-            running -= int(size or 0)
+            running -= frame_bytes(size)
         removed += drop_frames(conn, doomed)
     if removed:
         empty_dirs()
@@ -852,10 +1033,25 @@ def empty_dirs():
         pass
 
 
+def frame_bytes(value):
+    """A frame's size, clamped to something a frame could actually be.
+
+    The column is written by this program but read back from a file anyone
+    with the user's account can edit. One inflated row used to make prune
+    believe the archive was terabytes over budget and delete every frame in
+    it."""
+    try:
+        size = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    if size < 0:
+        return 0
+    return min(size, MAX_FRAME_BYTES)
+
+
 def usage(conn):
-    row = conn.execute(
-        "SELECT COUNT(*), COALESCE(SUM(bytes),0) FROM frames").fetchone()
-    return int(row[0]), int(row[1])
+    rows = conn.execute("SELECT bytes FROM frames").fetchall()
+    return len(rows), sum(frame_bytes(row[0]) for row in rows)
 
 
 def index_bytes():
@@ -1013,12 +1209,15 @@ def save_config(patch):
     try:
         raw = read_private(CONFIG)
         if raw is None:
-            raise FileNotFoundError(CONFIG)
-        loaded = json.loads(raw)
-        if isinstance(loaded, dict):
-            current = loaded
-    except FileNotFoundError:
-        current = dict(DEFAULTS)
+            current = dict(DEFAULTS)
+        else:
+            loaded = json.loads(raw)
+            current = loaded if isinstance(loaded, dict) else dict(DEFAULTS)
+    except Unreadable as exc:
+        # Refusing to read it is not licence to replace it. Overwriting here
+        # would have deleted a symlinked dotfiles config and everything in it.
+        log("not touching your config: %s" % exc)
+        return None
     except Exception as exc:
         log("config unreadable (%s), rewriting from defaults" % exc)
         current = dict(DEFAULTS)
@@ -1051,6 +1250,7 @@ class Recorder:
         self.worker = None
         self.coverage_cache = {}
         self.coverage_at = 0.0
+        self.cfg_stamp = config_stamp()
 
     # -- OCR runs off the capture thread; a slow read must never delay a frame.
     def ocr_worker(self):
@@ -1158,15 +1358,25 @@ class Recorder:
         compact = json.dumps(state, sort_keys=True)
         if compact == self.emitted:
             return
-        self.emitted = compact
         try:
             write_private(STATE_PATH, json.dumps(state))
+            self.emitted = compact
         except OSError:
             pass
         sys.stdout.write(compact + "\n")
         sys.stdout.flush()
 
     def tick(self):
+        # A blocklist the user just added has to take effect now, not at next
+        # login. The recorder read its config once at startup, so an app added
+        # to protect something kept being captured until the shell restarted.
+        stamp = config_stamp()
+        if stamp != getattr(self, "cfg_stamp", None):
+            self.cfg_stamp = stamp
+            self.cfg = load_config()
+            log("config reloaded")
+            self.coverage_at = 0.0
+
         if self.paused():
             self.emit(reason="paused", capturing=False)
             return
@@ -1194,7 +1404,17 @@ class Recorder:
         if not probed:
             self.emit(reason="focused window unknown", capturing=False)
             return
-        rule = blocked_by(self.cfg, app, title)
+
+        # grim hands back the whole output, so every window on it matters.
+        probed, windows = visible_windows(monitor)
+        if not probed:
+            self.emit(reason="window list unknown", capturing=False)
+            return
+        rule = ""
+        for other_app, other_title in windows + [(app, title)]:
+            rule = blocked_by(self.cfg, other_app, other_title)
+            if rule:
+                break
         if rule:
             # The frame is never taken. Nothing to delete later, because
             # nothing existed.
@@ -1360,7 +1580,7 @@ def cmd_search(args):
         # matching is not enough; near-identical excerpts are one moment too.
         if excerpt and (excerpt in seen_text or any(
                 difflib.SequenceMatcher(None, excerpt, other).ratio() > 0.75
-                for other in seen_text)):
+                for other in seen_text[-12:])):
             continue
         try:
             bits = int(row[7])
@@ -1508,17 +1728,38 @@ def cmd_doctor(_args):
 
     check("sqlite FTS5", fts_supported(), sqlite3.sqlite_version)
 
-    _, monitor, awake = focused_monitor()
+    probed, monitor, awake = focused_monitor()
     check("focused output", monitor is not None,
           "%s%s" % (monitor or "unknown", "" if awake else " (screen off)"))
 
-    ppm, err = capture(monitor)
-    check("capture", ppm is not None,
-          "%d bytes" % len(ppm) if ppm else err)
-    if ppm:
-        bits = average_hash(ppm)
-        check("frame hash", bits is not None,
-              "%d/%d bits set" % (bin(bits).count("1"), HASH_BITS) if bits else "unparsed")
+    # doctor used to screenshot unconditionally, so running it while the
+    # session was locked, paused, or showing a blocked window took exactly the
+    # frame the plugin promises never to take.
+    blocked = ""
+    if probed and monitor:
+        seen, windows = visible_windows(monitor)
+        for other_app, other_title in (windows if seen else []):
+            blocked = blocked_by(cfg, other_app, other_title) or blocked
+    refuse = ""
+    if os.path.exists(PAUSE_MARKER):
+        refuse = "paused"
+    elif session_locked() is not False:
+        refuse = "the session is locked, or cannot be asked"
+    elif not probed or not awake:
+        refuse = "the display is off, or cannot be asked"
+    elif blocked:
+        refuse = "a blocked window is on screen (%s)" % blocked
+    if refuse:
+        check("capture", True, "not attempted: %s" % refuse)
+    else:
+        ppm, err = capture(monitor)
+        check("capture", ppm is not None,
+              "%d bytes" % len(ppm) if ppm else err)
+        if ppm:
+            bits = average_hash(ppm)
+            check("frame hash", bits is not None,
+                  "%d/%d bits set" % (bin(bits).count("1"), HASH_BITS)
+                  if bits else "unparsed")
 
     exposed = []
     for root in (DATA, os.path.dirname(CONFIG)):

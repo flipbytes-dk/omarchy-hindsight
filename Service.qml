@@ -122,6 +122,16 @@ Item {
       }
     }
 
+    // Without this the recorder's diagnostics go into a pipe nobody reads:
+    // every "config unreadable", "refusing to delete", "tightened
+    // permissions" line was invisible, including while debugging this.
+    stderr: SplitParser {
+      onRead: function (line) {
+        var text = String(line).trim()
+        if (text !== "") console.warn("hindsight: " + text)
+      }
+    }
+
     onRunningChanged: root.recorderRunning = recorder.running
 
     onExited: function (exitCode) {
