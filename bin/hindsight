@@ -1085,9 +1085,12 @@ def blocked_by(cfg, app, title):
 def capture_gate(cfg, monitor):
     """Every reason not to photograph `monitor` right now, asked in one place.
 
-    Returns (reason, rule, app). An empty reason means the shot may be
-    taken; otherwise reason names the gate that refused, and rule names the
-    blocklist entry that matched, if one did.
+    Returns (reason, rule, app, title). An empty reason means the shot may
+    be taken; otherwise reason names the gate that refused, and rule names
+    the blocklist entry that matched, if one did. app and title come back
+    because the caller stores them with the frame, and a gate that answers
+    the question without handing back the answer invites the caller to go
+    and ask it a second time.
 
     tick() and doctor used to ask these questions separately and drifted
     apart: doctor grew the overlay check a round late, and still read a
@@ -1102,39 +1105,39 @@ def capture_gate(cfg, monitor):
     """
     probed, app, title = active_window()
     if not probed:
-        return "focused window unknown", "", ""
+        return "focused window unknown", "", "", ""
     rule = blocked_by(cfg, app, title)
     if rule:
-        return "blocked", rule, app
+        return "blocked", rule, app, title
 
     # grim hands back the whole output, so every window on it is in the
     # picture, not only the focused one.
     probed, windows = visible_windows(monitor)
     if not probed:
-        return "window list unknown", "", app
+        return "window list unknown", "", app, title
     for other_app, other_title in windows:
         rule = blocked_by(cfg, other_app, other_title)
         if rule:
-            return "blocked", rule, app
+            return "blocked", rule, app, title
 
     # Notifications, lock screens and launchers are layer-shell surfaces.
     # They are on the output and in the picture, and never in the window
     # list.
     probed, layers = visible_layers(monitor)
     if not probed:
-        return "overlay list unknown", "", app
+        return "overlay list unknown", "", app, title
     rule = blocked_layer(cfg, layers)
     if rule:
-        return "blocked", rule, app
+        return "blocked", rule, app, title
 
     # Last, because it is the slowest probe and the most consequential, so
     # its answer is the freshest thing in the frame.
     locked = session_locked()
     if locked is None:
-        return "lock state unknown", "", app
+        return "lock state unknown", "", app, title
     if locked:
-        return "locked", "", app
-    return "", "", app
+        return "locked", "", app, title
+    return "", "", app, title
 
 
 def capture(monitor):
@@ -1303,6 +1306,57 @@ def drop_frames(conn, rows):
     return removed
 
 
+# Five minutes between sweeps. An orphan is a bug rather than a routine
+# event, so finding one a few minutes late costs nothing.
+ORPHAN_SWEEP_INTERVAL = 300.0
+_orphan_sweep = {"at": 0.0}
+
+
+def sweep_orphans(conn, grace=120.0):
+    """Delete frames on disk that no row names.
+
+    A frame whose row never landed is worse than wasted disk: search cannot
+    reach it, and `forget` walks the index, so `forget all` leaves it behind.
+    That happened for real - a tick that raised after writing the file and
+    before storing the row left 71 of them - and it is cheap to make the
+    archive self-correcting rather than trust that it cannot happen again.
+
+    Only files older than the grace window are considered, because the
+    recorder writes the file before it writes the row and a frame caught in
+    that gap is not an orphan yet.
+    """
+    known = set()
+    try:
+        for (path,) in conn.execute("SELECT path FROM frames"):
+            known.add(path)
+    except sqlite3.Error:
+        return 0
+    root = os.path.join(DATA, "frames")
+    cutoff = time.time() - grace
+    removed = 0
+    for base, _dirs, files in os.walk(root):
+        for name in files:
+            if not name.endswith(".webp"):
+                continue
+            path = os.path.join(base, name)
+            if path in known:
+                continue
+            try:
+                if os.lstat(path).st_mtime > cutoff:
+                    continue
+            except OSError:
+                continue
+            # Same guarded deletion the index-driven path uses: descends the
+            # archive one component at a time and refuses anything that is
+            # not a regular file of ours inside it.
+            if unlink_frame(path):
+                removed += 1
+    if removed:
+        log("removed %d frame(s) on disk that the index did not know about"
+            % removed)
+    return removed
+
+
 def prune(conn, cfg):
     """Ring-buffer the archive: oldest frames go first, by age then by size."""
     removed = 0
@@ -1358,6 +1412,12 @@ def prune(conn, cfg):
             doomed.append((frame_id, path))
             running -= size
         removed += drop_frames(conn, doomed)
+    # Throttled: the sweep walks the whole archive, and prune runs every
+    # tick. At a hundred thousand frames that is a full walk every four
+    # seconds to find something that should never appear at all.
+    if time.time() - _orphan_sweep["at"] >= ORPHAN_SWEEP_INTERVAL:
+        _orphan_sweep["at"] = time.time()
+        removed += sweep_orphans(conn)
     if removed:
         empty_dirs()
         _archive_measure["at"] = 0.0
@@ -1858,7 +1918,7 @@ class Recorder:
 
         # The frame is never taken when this refuses, so there is nothing to
         # delete afterwards, because nothing existed.
-        reason, rule, app = capture_gate(self.cfg, monitor)
+        reason, rule, app, title = capture_gate(self.cfg, monitor)
         if reason:
             self.refuse(reason, rule)
             return
@@ -1883,7 +1943,7 @@ class Recorder:
         # still only in memory here, so it costs nothing to drop it. Paid
         # once per kept frame rather than once per tick, because change
         # detection has already discarded the rest.
-        reason, rule, _ = capture_gate(self.cfg, monitor)
+        reason, rule, _, _ = capture_gate(self.cfg, monitor)
         if reason:
             self.refuse(reason, rule)
             return
@@ -2216,7 +2276,7 @@ def cmd_doctor(_args):
         refuse = "the display is off, or cannot be asked"
     else:
         # The same gate the recorder uses, refusing for the same reasons.
-        reason, rule, _ = capture_gate(cfg, monitor)
+        reason, rule, _, _ = capture_gate(cfg, monitor)
         if rule:
             refuse = "a blocked window is on screen (%s)" % rule
         elif reason:

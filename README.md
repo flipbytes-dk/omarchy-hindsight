@@ -156,7 +156,9 @@ This plugin exists to remember your screen, so it is built to be told no.
   frame is not taken. A blocklist is worth no more than the probe behind it,
   so a timed-out `hyprctl` costs you a gap in the archive rather than a
   recorded password.
-- **Forget.** `bin/hindsight forget today`, a specific day, or `all`.
+- **Forget.** `bin/hindsight forget today`, a specific day, or `all`. The
+  archive is swept for frames the index does not know about, so a frame whose
+  row never landed cannot outlive a `forget all` by hiding from it.
 - **No other user can read it.** Every directory is `0700` and every file
   `0600` - frames, the index and its WAL, config, state. The recorder also
   repairs anything an earlier version left loose when it starts, and
@@ -218,7 +220,7 @@ Frames and the index live in `~/.local/share/omarchy-hindsight/`.
 python3 tests/test-index.py
 ```
 
-216 offline checks covering the hashing, the blocklist, query sanitising, the
+224 offline checks covering the hashing, the blocklist, query sanitising, the
 search round trip, ring-buffer pruning, age retention, index migration, and the
 frame-vanished-under-the-backfill case — none of which need a screen.
 

@@ -1148,19 +1148,19 @@ try:
         for name, fn in CLEAR.items():
             setattr(hs, name, fn)
         setattr(hs, probe, mute)
-        reason, rule, _ = hs.capture_gate(dict(hs.DEFAULTS), "DP-1")
+        reason, rule, _, _ = hs.capture_gate(dict(hs.DEFAULTS), "DP-1")
         check("a silent %s refuses the frame" % probe, reason == want,
               "reason=%r rule=%r" % (reason, rule))
     for name, fn in CLEAR.items():
         setattr(hs, name, fn)
-    reason, rule, app = hs.capture_gate(dict(hs.DEFAULTS), "DP-1")
+    reason, rule, app, _ = hs.capture_gate(dict(hs.DEFAULTS), "DP-1")
     check("and an answered, clear screen is captured",
           reason == "" and rule == "" and app == "ghostty",
           "reason=%r rule=%r app=%r" % (reason, rule, app))
     # A blocked overlay must be named, not merely refused: the panel shows
     # the rule so the user can see why the recorder went quiet.
     hs.visible_layers = lambda m: (True, ["swaync-control-center"])
-    reason, rule, _ = hs.capture_gate(dict(hs.DEFAULTS), "DP-1")
+    reason, rule, _, _ = hs.capture_gate(dict(hs.DEFAULTS), "DP-1")
     check("a blocked overlay is refused and named",
           reason == "blocked" and rule == "swaync", "%r %r" % (reason, rule))
 finally:
@@ -1210,7 +1210,7 @@ finally:
 # cannot be added to one and forgotten in the other.
 gate_calls = []
 real_gate = hs.capture_gate
-hs.capture_gate = lambda cfg, m: (gate_calls.append(m), ("paused", "", ""))[1]
+hs.capture_gate = lambda cfg, m: (gate_calls.append(m), ("paused", "", "", ""))[1]
 saved5 = (hs.focused_monitor, hs.capture)
 try:
     hs.focused_monitor = lambda: (True, "DP-1", True)
@@ -1237,6 +1237,97 @@ finally:
     hs.capture_gate = real_gate
     (hs.focused_monitor, hs.capture) = saved5
 
+
+
+print("\n-- a clear screen goes all the way into the index --")
+# Every other tick test asserts that some gate refused. None of them ran a
+# frame through to the end, so when capture_gate stopped handing back the
+# window title, store() raised NameError, the loop logged "tick failed", and
+# 71 frames sat on disk with no row pointing at them - invisible to search
+# and, because forget works off rows, untouched by "forget all".
+saved6 = {k: getattr(hs, k) for k in
+          ("active_window", "visible_windows", "visible_layers",
+           "session_locked", "focused_monitor", "capture", "encode_webp")}
+g6 = hs.Recorder.__new__(hs.Recorder)
+g6.cfg = dict(hs.DEFAULTS)
+g6.cfg_stamp = hs.config_stamp()
+g6.conn = hs.connect()
+g6.emitted = None
+g6.dropped_ocr = 0
+g6.last_hash = None
+g6.coverage_cache = {"coverageDays": 0, "coverageText": "",
+                     "coverageBasis": "default"}
+g6.coverage_at = time.time()
+g6.jobs = __import__("queue").Queue(maxsize=8)
+try:
+    hs.focused_monitor = lambda: (True, "DP-1", True)
+    hs.active_window = lambda: (True, "ghostty", "a distinctive title")
+    hs.visible_windows = lambda m: (True, [("ghostty", "a distinctive title")])
+    hs.visible_layers = lambda m: (True, [])
+    hs.session_locked = lambda: False
+    hs.capture = lambda m: (ppm(8, 8, lambda x, y: ((x * 31) % 256, y * 7, 9)), "")
+    hs.encode_webp = lambda p, q: (b"RIFFfake", "")
+    before = hs.usage(g6.conn)[0]
+    g6.tick()
+    after = hs.usage(g6.conn)[0]
+    check("an unblocked tick stores exactly one frame", after == before + 1,
+          "%d -> %d" % (before, after))
+    row = g6.conn.execute(
+        "SELECT app, title, path FROM frames ORDER BY id DESC LIMIT 1").fetchone()
+    check("and records the app and title the gate saw",
+          row and row[0] == "ghostty" and row[1] == "a distinctive title", row)
+    check("and the file it wrote is the file the row points at",
+          row and os.path.exists(row[2]), row and row[2])
+    # The orphan is the thing that actually hurt: a frame on disk that no row
+    # names is a frame "forget all" cannot reach.
+    known = {r[0] for r in g6.conn.execute("SELECT path FROM frames")}
+    orphans = []
+    # Today's directory only: other tests plant frames on other days on
+    # purpose, and one of them is a deliberate orphan.
+    for base, _dirs, files in os.walk(
+            os.path.join(hs.DATA, "frames", time.strftime("%Y-%m-%d"))):
+        for f in files:
+            if f.endswith(".webp") and os.path.join(base, f) not in known:
+                orphans.append(os.path.join(base, f))
+    check("no frame is left on disk without a row naming it", not orphans,
+          orphans[:3])
+finally:
+    for name, fn in saved6.items():
+        setattr(hs, name, fn)
+
+
+print("\n-- an orphaned frame is reclaimed, a fresh one is left alone --")
+# forget walks the index, so a frame no row names survives "forget all".
+orphan_day = os.path.join(hs.DATA, "frames", "2021-06-01")
+os.makedirs(orphan_day, exist_ok=True)
+stale = os.path.join(orphan_day, "120000-000.webp")
+fresh = os.path.join(orphan_day, "120004-000.webp")
+for f in (stale, fresh):
+    io.open(f, "wb").write(b"RIFForphan")
+old_time = time.time() - 3600
+os.utime(stale, (old_time, old_time))
+conn_o = hs.connect()
+named = os.path.join(orphan_day, "120008-000.webp")
+io.open(named, "wb").write(b"RIFFkept")
+os.utime(named, (old_time, old_time))
+hs.store(conn_o, old_time, named, "ghostty", "kept", "DP-1", 1, 8)
+swept = hs.sweep_orphans(conn_o)
+check("the orphan past the grace window is removed",
+      swept >= 1 and not os.path.exists(stale), "swept=%d" % swept)
+check("a frame written moments ago is not mistaken for an orphan",
+      os.path.exists(fresh))
+check("and a frame the index does name is untouched", os.path.exists(named))
+
+# The guard that matters: a planted symlink must not turn the sweep into a
+# way to delete something outside the archive.
+outside = os.path.join(TMP, "not-a-frame.webp")
+io.open(outside, "wb").write(b"keep me")
+link = os.path.join(orphan_day, "130000-000.webp")
+os.symlink(outside, link)
+os.utime(link, (old_time, old_time), follow_symlinks=False)
+hs.sweep_orphans(conn_o)
+check("the sweep does not follow a symlink out of the archive",
+      os.path.exists(outside), outside)
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 if FAIL:
