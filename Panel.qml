@@ -56,8 +56,15 @@ Panel {
   // confirm you found the right moment.
   function copyCurrent() {
     if (!root.results || root.cursor >= root.results.length) return
+    // The id and the path both arrive as JSON from the helper, so neither is
+    // pasted into the command string. The id has to look like a plain number
+    // before it is used at all, and it reaches the shell as an argument
+    // rather than as text spliced into the script.
+    var id = Number(root.results[root.cursor].id)
+    if (!isFinite(id) || id <= 0 || Math.floor(id) !== id) return
     copier.command = ["sh", "-c",
-      "python3 " + root.service.helperPath + " text " + root.results[root.cursor].id + " | wl-copy"]
+      "\"$1\" \"$2\" text \"$3\" | wl-copy",
+      "hindsight-copy", "python3", root.service.helperPath, String(id)]
     copier.running = true
   }
 

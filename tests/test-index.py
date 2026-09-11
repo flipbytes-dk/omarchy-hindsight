@@ -340,16 +340,24 @@ variants = [
 import random
 random.seed(11)
 for index, text in enumerate(variants):
-    fid = hs.store(dedup, now + index, "/x/dup%d.webp" % index, "app",
-                   "t", "DP-1", random.getrandbits(hs.HASH_BITS), 1000)
+    fid = hs.store(dedup, now + index,
+                   os.path.join(hs.FRAMES, "2021-05-05", "dup%d.webp" % index),
+                   "app", "t", "DP-1", random.getrandbits(hs.HASH_BITS), 1000)
     hs.attach_text(dedup, fid, text, "app", "t")
-fid = hs.store(dedup, now + 9, "/x/other.webp", "app", "t", "DP-1",
-               random.getrandbits(hs.HASH_BITS), 1000)
+fid = hs.store(dedup, now + 9,
+               os.path.join(hs.FRAMES, "2021-05-05", "other.webp"),
+               "app", "t", "DP-1", random.getrandbits(hs.HASH_BITS), 1000)
 hs.attach_text(dedup, fid,
                "a different screen entirely about forecast wind speeds offshore",
                "app", "t")
 
 import io, contextlib, json as _json
+
+def _search(conn, term):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        hs.cmd_search([term])
+    return len(_json.loads(buf.getvalue())["results"])
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     hs.cmd_search(["forecast"])
@@ -540,6 +548,14 @@ open(real, "wb").write(b"frame")
 fid = hs.store(attack, time.time(), real, "app", "t", "DP-1", 1, 5)
 hs.drop_frames(attack, [(fid, real)])
 check("a genuine frame is still deleted", not os.path.exists(real))
+
+check("a result whose path escapes the archive is not returned",
+      (lambda: (
+          hs.attach_text(dedup,
+                         hs.store(dedup, time.time(), "/etc/shadow", "app", "t",
+                                  "DP-1", random.getrandbits(hs.HASH_BITS), 10),
+                         "forecast of an unrelated secret file", "app", "t"),
+          _search(dedup, "unrelated"))[1])() == 0)
 
 print("\n-- config and state reads are bounded and refuse links --")
 cfg_link = os.path.join(TMP, "config-link.json")

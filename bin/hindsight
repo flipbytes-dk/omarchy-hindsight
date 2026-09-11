@@ -106,6 +106,127 @@ def log(message):
     sys.stderr.flush()
 
 
+MAX_ARCHIVE_DEPTH = 8         # frames live two levels down; this is slack, not a limit to use
+MAX_FRAME_BYTES = 64 * 1024 * 1024
+
+
+def archive_descend(path):
+    """Open the directory holding `path`, descending from the archive one
+    component at a time with O_NOFOLLOW.
+
+    O_NOFOLLOW only guards the component it opens, so checking the final
+    name is not enough: a symlinked day directory would send a write, a read
+    or a delete anywhere on the disk. Walking from a descriptor of the
+    archive itself means every component is checked, and the directory
+    cannot be swapped for a link between the check and the use.
+
+    Returns (fds, name) where fds[-1] is the parent directory, or (None,
+    reason)."""
+    try:
+        rel = os.path.relpath(path, FRAMES)
+    except ValueError:
+        return None, "outside the archive"
+    parts = rel.split(os.sep)
+    if os.path.isabs(rel) or any(part in ("", ".", "..") for part in parts):
+        return None, "outside the archive"
+    if len(parts) > MAX_ARCHIVE_DEPTH:
+        return None, "nested deeper than the archive ever goes"
+
+    fds = []
+    try:
+        fds.append(os.open(FRAMES, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW))
+    except OSError as exc:
+        return None, "archive unavailable: %s" % exc
+    for part in parts[:-1]:
+        try:
+            fds.append(os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                               dir_fd=fds[-1]))
+        except OSError as exc:
+            close_fds(fds)
+            return None, str(exc)
+    return fds, parts[-1]
+
+
+def close_fds(fds):
+    for fd in reversed(fds or []):
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def open_day_dir(day):
+    """Create and open a day directory inside the archive, refusing a link.
+
+    If something has replaced today's directory with a symlink, opening it
+    with O_NOFOLLOW fails and no frame is written, which is the right
+    outcome: a missing frame beats a frame written somewhere else."""
+    root = None
+    try:
+        root = os.open(FRAMES, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.mkdir(day, DIR_MODE, dir_fd=root)
+        except FileExistsError:
+            pass
+        fd = os.open(day, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root)
+        info = os.fstat(fd)
+        if info.st_uid != os.getuid() or not statmod.S_ISDIR(info.st_mode):
+            os.close(fd)
+            log("refusing to use %s: not a directory of ours" % day)
+            return None
+        if (info.st_mode & 0o777) != DIR_MODE:
+            os.fchmod(fd, DIR_MODE)
+        return fd
+    except OSError as exc:
+        log("cannot open the day directory %s (%s)" % (day, exc))
+        return None
+    finally:
+        if root is not None:
+            try:
+                os.close(root)
+            except OSError:
+                pass
+
+
+def read_frame_bytes(path, limit=MAX_FRAME_BYTES):
+    """Read a stored frame, refusing anything that is not a regular file of
+    ours inside the archive."""
+    fds, name = archive_descend(path)
+    if fds is None:
+        log("refusing to read %s: %s" % (path, name))
+        return None
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                     dir_fd=fds[-1])
+    except OSError as exc:
+        log("could not read %s (%s)" % (path, exc))
+        close_fds(fds)
+        return None
+    try:
+        info = os.fstat(fd)
+        if not statmod.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            log("refusing to read %s: not a regular file of ours" % path)
+            return None
+        if info.st_size > limit:
+            log("refusing to read %s: larger than %d bytes" % (path, limit))
+            return None
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    except OSError:
+        return None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        close_fds(fds)
+
+
 MAX_TEXT_BYTES = 256 * 1024   # config and state are small; anything larger is not ours
 
 
@@ -146,14 +267,17 @@ def read_private(path, limit=MAX_TEXT_BYTES):
                 pass
 
 
-def write_private(path, data):
+def write_private(path, data, dir_fd=None, name=None):
     """Create or replace a file of ours, never through a symlink."""
     if isinstance(data, str):
         data = data.encode("utf-8")
     fd = None
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
-                     FILE_MODE)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+        if dir_fd is not None:
+            fd = os.open(name, flags, FILE_MODE, dir_fd=dir_fd)
+        else:
+            fd = os.open(path, flags, FILE_MODE)
         os.fchmod(fd, FILE_MODE)
         os.write(fd, data)
         return True
@@ -208,9 +332,12 @@ def secure(path, mode, dir_fd=None, name=None):
     return False
 
 
-def harden_dir(fd, path):
+def harden_dir(fd, path, depth=0):
     """Repair one directory's contents, descending through descriptors only."""
     fixed = 0
+    if depth > MAX_ARCHIVE_DEPTH:
+        log("stopping the permission repair below %s: nested too deep" % path)
+        return 0
     try:
         entries = list(os.scandir(fd))
     except OSError:
@@ -230,7 +357,7 @@ def harden_dir(fd, path):
                     child = os.open(entry.name,
                                     os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                                     dir_fd=fd)
-                    fixed += harden_dir(child, os.path.join(path, entry.name))
+                    fixed += harden_dir(child, os.path.join(path, entry.name), depth + 1)
                 except OSError:
                     pass
                 finally:
@@ -292,8 +419,29 @@ def secure_db_files():
         secure(DB_PATH + suffix, FILE_MODE)
 
 
+def check_db_path():
+    """sqlite3.connect follows symlinks, so a planted link would send the
+    whole index somewhere else. The same goes for the WAL and shared-memory
+    files SQLite creates beside it."""
+    for suffix in ("", "-wal", "-shm"):
+        target = DB_PATH + suffix
+        try:
+            info = os.lstat(target)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise RuntimeError("cannot inspect %s (%s)" % (target, exc))
+        if statmod.S_ISLNK(info.st_mode):
+            raise RuntimeError("%s is a symlink; refusing to open it" % target)
+        if not statmod.S_ISREG(info.st_mode):
+            raise RuntimeError("%s is not a regular file" % target)
+        if info.st_uid != os.getuid():
+            raise RuntimeError("%s is owned by another user" % target)
+
+
 def connect():
     ensure_dirs()
+    check_db_path()
     conn = sqlite3.connect(DB_PATH, timeout=15)
     secure_db_files()
     conn.execute("PRAGMA journal_mode=WAL")
@@ -543,8 +691,16 @@ def encode_webp(ppm, quality):
 
 
 def ocr_frame_file(path, timeout):
-    """Recover text from a frame already on disk, via its stored image."""
-    code, ppm, _ = run(["magick", path, "ppm:-"], timeout=20)
+    """Recover text from a frame already on disk.
+
+    The bytes are read here and piped in, rather than handing the path to
+    magick. The path comes from the database, and ImageMagick reads meaning
+    into a filename: prefixes and delegate formats can make it open things,
+    or run things, that were never intended. It is never shown the name."""
+    data = read_frame_bytes(path)
+    if not data:
+        return None
+    code, ppm, _ = run(["magick", "webp:-", "ppm:-"], timeout=20, stdin_bytes=data)
     if code != 0 or not ppm:
         return None
     return ocr_text(ppm, timeout)
@@ -566,12 +722,13 @@ def ocr_text(ppm, timeout):
 
 
 def frame_path(ts):
+    """(day, filename, full path). Nothing is created here: the caller opens
+    the day directory through a descriptor so a symlink cannot redirect the
+    write."""
     day = time.strftime("%Y-%m-%d", time.localtime(ts))
-    name = time.strftime("%H%M%S", time.localtime(ts))
-    directory = os.path.join(FRAMES, day)
-    os.makedirs(directory, mode=DIR_MODE, exist_ok=True)
-    secure(directory, DIR_MODE)
-    return day, os.path.join(directory, "%s-%03d.webp" % (name, int(ts * 1000) % 1000))
+    stamp = time.strftime("%H%M%S", time.localtime(ts))
+    name = "%s-%03d.webp" % (stamp, int(ts * 1000) % 1000)
+    return day, name, os.path.join(FRAMES, day, name)
 
 
 def store(conn, ts, path, app, title, monitor, hash_bits, size):
@@ -597,47 +754,19 @@ def unlink_frame(path):
     """Delete one frame, refusing anything that is not a regular file we own
     inside the archive.
 
-    The path comes out of the database, and the database is a file on disk
-    like any other. Handing whatever it says to os.remove() would turn prune
-    and forget into a way to delete arbitrary files, so every component is
-    opened with O_NOFOLLOW: a symlink anywhere along the way stops the walk
-    instead of redirecting it.
-
-    True means the row may go, because the file is gone or was never a frame
-    of ours. False means try again later, so a missing mount or a busy file
-    does not quietly empty the index."""
-    try:
-        rel = os.path.relpath(path, FRAMES)
-    except ValueError:
-        log("refusing to delete %s: outside the archive" % path)
-        return True
-    parts = rel.split(os.sep)
-    if os.path.isabs(rel) or any(part in ("", ".", "..") for part in parts):
-        log("refusing to delete %s: outside the archive" % path)
-        return True
-
-    open_fds = []
-    try:
-        try:
-            fd = os.open(FRAMES, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        except OSError as exc:
-            log("cannot open the archive (%s); leaving %s alone" % (exc, path))
+    True means the row may go: the file is gone, or was never a frame of
+    ours. False means try again later, so a missing mount does not quietly
+    empty the index."""
+    fds, name = archive_descend(path)
+    if fds is None:
+        if "unavailable" in name:
+            log("cannot open the archive (%s); leaving %s alone" % (name, path))
             return False
-        open_fds.append(fd)
-        for part in parts[:-1]:
-            try:
-                fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-                             dir_fd=open_fds[-1])
-            except FileNotFoundError:
-                return True
-            except OSError as exc:
-                log("refusing to delete %s (%s)" % (path, exc))
-                return True
-            open_fds.append(fd)
-
-        name = parts[-1]
+        log("refusing to delete %s: %s" % (path, name))
+        return True
+    try:
         try:
-            info = os.stat(name, dir_fd=open_fds[-1], follow_symlinks=False)
+            info = os.stat(name, dir_fd=fds[-1], follow_symlinks=False)
         except FileNotFoundError:
             return True
         except OSError as exc:
@@ -647,7 +776,7 @@ def unlink_frame(path):
             log("refusing to delete %s: not a regular file of ours" % path)
             return True
         try:
-            os.unlink(name, dir_fd=open_fds[-1])
+            os.unlink(name, dir_fd=fds[-1])
         except FileNotFoundError:
             pass
         except OSError as exc:
@@ -655,11 +784,7 @@ def unlink_frame(path):
             return False
         return True
     finally:
-        for fd in reversed(open_fds):
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+        close_fds(fds)
 
 
 def drop_frames(conn, rows):
@@ -1096,9 +1221,20 @@ class Recorder:
             return
 
         now = time.time()
-        _, path = frame_path(now)
+        day, name, path = frame_path(now)
         try:
-            if not write_private(path, webp):
+            day_fd = open_day_dir(day)
+            if day_fd is None:
+                self.emit(reason="archive unavailable", capturing=False)
+                return
+            try:
+                ok = write_private(None, webp, dir_fd=day_fd, name=name)
+            finally:
+                try:
+                    os.close(day_fd)
+                except OSError:
+                    pass
+            if not ok:
                 self.emit(reason="could not write frame", capturing=False)
                 return
         except OSError as exc:
@@ -1142,6 +1278,22 @@ class Recorder:
 
 # --------------------------------------------------------------------------
 # commands
+
+
+def inside_archive(path):
+    """True when a stored path really names a frame inside the archive.
+
+    Search results feed the panel, which renders the path as an image, so a
+    row that has been tampered with must not be able to point the viewer at
+    an arbitrary file."""
+    try:
+        rel = os.path.relpath(path or "", FRAMES)
+    except ValueError:
+        return False
+    parts = rel.split(os.sep)
+    return (not os.path.isabs(rel)
+            and len(parts) <= MAX_ARCHIVE_DEPTH
+            and not any(part in ("", ".", "..") for part in parts))
 
 
 def fts_query(term):
@@ -1224,6 +1376,7 @@ def cmd_search(args):
         kept.append(row)
     rows = kept
 
+    rows = [row for row in rows if inside_archive(row[4])]
     results = [{
         "id": row[0],
         "ts": row[1],
@@ -1244,6 +1397,7 @@ def cmd_timeline(args):
     rows = conn.execute(
         "SELECT id,ts,app,title,path FROM frames WHERE day=? ORDER BY ts",
         (day,)).fetchall()
+    rows = [r for r in rows if inside_archive(r[4])]
     print(json.dumps({"day": day, "frames": [{
         "id": r[0],
         "ts": r[1],
