@@ -613,6 +613,75 @@ check("and the link target is untouched",
       open(bait).read() == "not ours")
 os.remove(cfg_link)
 
+print("\n-- a blocked window anywhere on the screen stops the capture --")
+check("hyprctl answering {} is not 'no window', it is 'cannot tell'",
+      with_run(lambda *a, **k: (0, b"{}", b""), hs.active_window)[0] is False)
+check("a real answer is still accepted",
+      with_run(lambda *a, **k: (0, b'{"class":"ghostty","title":"x"}', b""),
+               hs.active_window) == (True, "ghostty", "x"))
+
+def hypr(monitors, clients):
+    def fake(cmd, **kwargs):
+        if cmd[:2] == ["hyprctl", "monitors"]:
+            return 0, json.dumps(monitors).encode(), b""
+        if cmd[:2] == ["hyprctl", "clients"]:
+            return 0, json.dumps(clients).encode(), b""
+        return 1, b"", b"no"
+    return fake
+
+import json
+one_screen = [{"name": "DP-1", "activeWorkspace": {"id": 1}}]
+tiled = [
+    {"class": "com.mitchellh.ghostty", "title": "work", "workspace": {"id": 1},
+     "mapped": True, "hidden": False},
+    {"class": "1Password", "title": "Vault", "workspace": {"id": 1},
+     "mapped": True, "hidden": False},
+]
+probed, windows = with_run(hypr(one_screen, tiled),
+                           lambda: hs.visible_windows("DP-1"))
+check("both tiled windows are seen", probed and len(windows) == 2, windows)
+check("the password manager beside the focused window is caught",
+      any(hs.blocked_by(hs.DEFAULTS, a, t) for a, t in windows))
+
+elsewhere = [dict(tiled[0]), dict(tiled[1], workspace={"id": 9})]
+probed, windows = with_run(hypr(one_screen, elsewhere),
+                           lambda: hs.visible_windows("DP-1"))
+check("a window on another workspace is not on screen and does not block",
+      probed and len(windows) == 1 and
+      not any(hs.blocked_by(hs.DEFAULTS, a, t) for a, t in windows), windows)
+
+check("an unreadable client list is not an empty one",
+      with_run(lambda *a, **k: (1, b"", b"boom"),
+               lambda: hs.visible_windows("DP-1")) == (False, []))
+
+# The gate end to end: a blocked window that is NOT focused must stop capture.
+seen = []
+real_capture = hs.capture
+hs.capture = lambda monitor: (seen.append(monitor), (None, "must not run"))[1]
+gate2 = hs.Recorder.__new__(hs.Recorder)
+gate2.cfg = dict(hs.DEFAULTS)
+gate2.conn = hs.connect()
+gate2.emitted = None
+gate2.dropped_ocr = 0
+gate2.last_hash = None
+gate2.coverage_cache = {"coverageDays": 0, "coverageText": "", "coverageBasis": "default"}
+gate2.coverage_at = time.time()
+real_locked, real_monitor, real_active, real_visible = (
+    hs.session_locked, hs.focused_monitor, hs.active_window, hs.visible_windows)
+hs.session_locked = lambda: False
+hs.focused_monitor = lambda: (True, "DP-1", True)
+hs.active_window = lambda: (True, "com.mitchellh.ghostty", "work")
+hs.visible_windows = lambda monitor: (True, [("com.mitchellh.ghostty", "work"),
+                                             ("1Password", "Vault")])
+try:
+    gate2.tick()
+finally:
+    hs.session_locked, hs.focused_monitor = real_locked, real_monitor
+    hs.active_window, hs.visible_windows = real_active, real_visible
+    hs.capture = real_capture
+check("the recorder never reaches capture with a blocked window on screen",
+      not seen, seen)
+
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 if FAIL:
     print("failed: " + ", ".join(FAIL))
