@@ -62,9 +62,17 @@ DEFAULTS = {
     # toast, so the daemons are named directly: a frame is skipped while any
     # notification is on screen, because the code in it is not ours to judge.
     "blocklistLayers": [
-        "mako", "swaync", "dunst", "fnott", "notifications",
-        "swaylock", "hyprlock", "wlogout", "rofi", "fuzzel", "wofi",
-        "anyrun", "tofi",
+        "mako", "swaync", "dunst", "fnott",
+        # Both spellings: a bar writes "notifications", astal and eww
+        # examples write "notification", and "notification-popups" and
+        # "quickshell:notifications" are the same surface under a separator
+        # the matcher has to know about.
+        "notifications", "notification",
+        "swaylock", "hyprlock", "lockscreen", "wlogout",
+        # fuzzel and tofi both name their surface "launcher" rather than
+        # themselves, which is why Hyprland blur rules are written against
+        # that word and not against the binary.
+        "rofi", "fuzzel", "wofi", "anyrun", "tofi", "launcher",
     ],
     "blocklistTitles": [],
 }
@@ -928,11 +936,66 @@ def visible_layers(monitor_name):
     return True, names
 
 
+def compositor_locked():
+    """True, False, or None, asked of the compositor rather than of logind.
+
+    The lock this plugin actually ships against leaves no trace in either of
+    the places the other probes look. Omarchy locks with an
+    ext-session-lock-v1 surface drawn by the quickshell process that is
+    already running, so there is no locker to find by name, and nothing sets
+    logind's LockedHint: Hyprland 0.56 contains no reference to it, and
+    neither does anything under /usr/share/omarchy. The session answers an
+    unprompted "LockedHint=no" the whole time the screen is locked.
+
+    The lock is visible in one place - it is one of the reasons a monitor
+    cannot go solitary - which is what omarchy-hyprland-session-locked reads
+    too. Hyprland stops at the first reason it finds, so a monitor still
+    waiting for a workspace was never asked about the lock at all: that is
+    None, not unlocked.
+    """
+    code, out, _ = run(["hyprctl", "monitors", "-j"], timeout=3)
+    if code != 0:
+        return None
+    try:
+        monitors = json.loads(out.decode("utf-8", "replace") or "[]")
+    except Exception:
+        return None
+    if not isinstance(monitors, list) or not monitors:
+        return None
+    asked = False
+    for mon in monitors:
+        if not isinstance(mon, dict):
+            return None
+        blockers = mon.get("solitaryBlockedBy")
+        if not isinstance(blockers, list):
+            # A Hyprland too old to report the field cannot be asked, and a
+            # question that cannot be asked is not an answer of "no".
+            return None
+        names = [str(item) for item in blockers]
+        if "LOCK" in names:
+            return True
+        if "WORKSPACE" not in names:
+            asked = True
+    return False if asked else None
+
+
 def session_locked():
-    """True, False, or None when neither probe could answer.
+    """True, False, or None when nothing could answer.
 
     None is not the same as unlocked. An unanswered question about whether
     the screen is locked is not permission to record it."""
+    # The compositor is asked first because it is the only one of the three
+    # that can see a session lock, and because it is a single call: the
+    # pgrep-and-loginctl pair below measured 109 ms, which was most of the
+    # gap between the last gate and the shutter. A smaller gap is worth more
+    # than a second look across a large one.
+    compositor = compositor_locked()
+    if compositor is not None:
+        return compositor
+
+    # Everything below can only add a "locked". Reached when the compositor
+    # could not be asked, where the old, weaker answer is better than none.
+    #
     # run() rather than subprocess.run(): a missing pgrep used to raise here
     # and take the recorder down with it.
     for locker in ("hyprlock", "swaylock", "gtklock", "waylock"):
@@ -944,24 +1007,18 @@ def session_locked():
     # `loginctl show-session self` exits 1 with "Caller does not belong to any
     # known session", so asking only that way made the lock state permanently
     # unknown and, with the fail-closed rule, stopped capture for good.
-    unlocked = False
     for session in login_sessions():
         code, out, _ = run(["loginctl", "show-session", session,
                             "-p", "LockedHint", "--value"], timeout=3)
         if code != 0:
             continue
-        hint = out.decode("utf-8", "replace").strip().lower()
-        if hint == "yes":
+        if out.decode("utf-8", "replace").strip().lower() == "yes":
             # One session saying it is locked settles it. Returning on the
             # first answer instead let a session that can never lock speak
             # for one that had.
             return True
-        if hint == "no":
-            unlocked = True
-    if unlocked:
-        return False
-    # Knowing that a handful of named lockers are absent is not the same as
-    # knowing the session is unlocked; only an explicit "no" is.
+    # A handful of named lockers being absent is not knowing the screen is
+    # clear, and neither is a LockedHint that nothing on this desktop writes.
     return None
 
 
@@ -987,9 +1044,16 @@ def blocked_layer(cfg, namespaces):
             # Namespaces name themselves at one end or the other:
             # "swaync-control-center" leads with the daemon, while a
             # reverse-DNS name like "org.freedesktop.Notifications" ends with
-            # it. Matching either end catches both and still leaves a status
-            # bar called "eww-notifications-bar" alone, which is neither.
-            parts = re.split(r"[-._]", hay)
+            # it. Matching either end catches both, and leaves the middle
+            # alone, so "eww-notifications-bar" still records.
+            #
+            # A bar named "notifications-bar" does not, and there is no way
+            # to tell it apart from a notification daemon by name. It blocks,
+            # the panel names the rule that did it, and the rule can be taken
+            # out of blocklistLayers. Erring the other way would mean
+            # recording notification popups on every desktop that names the
+            # surface for what it holds.
+            parts = re.split(r"[-._:/]", hay)
             if hay == token or parts[0] == token or parts[-1] == token:
                 return str(needle)
     return ""
@@ -1016,6 +1080,61 @@ def blocked_by(cfg, app, title):
                 % (pattern, exc))
             return str(pattern)
     return ""
+
+
+def capture_gate(cfg, monitor):
+    """Every reason not to photograph `monitor` right now, asked in one place.
+
+    Returns (reason, rule, app). An empty reason means the shot may be
+    taken; otherwise reason names the gate that refused, and rule names the
+    blocklist entry that matched, if one did.
+
+    tick() and doctor used to ask these questions separately and drifted
+    apart: doctor grew the overlay check a round late, and still read a
+    probe that could not answer as a probe that said yes, so running it
+    with a broken hyprctl took exactly the frame the plugin promises never
+    to take. One gate list now, and one set of failure semantics, because a
+    gate added to one copy is a gate missing from the other.
+
+    Every branch fails closed. A probe that cannot answer refuses the frame
+    for the same reason a probe that answers "locked" does: neither of them
+    said yes.
+    """
+    probed, app, title = active_window()
+    if not probed:
+        return "focused window unknown", "", ""
+    rule = blocked_by(cfg, app, title)
+    if rule:
+        return "blocked", rule, app
+
+    # grim hands back the whole output, so every window on it is in the
+    # picture, not only the focused one.
+    probed, windows = visible_windows(monitor)
+    if not probed:
+        return "window list unknown", "", app
+    for other_app, other_title in windows:
+        rule = blocked_by(cfg, other_app, other_title)
+        if rule:
+            return "blocked", rule, app
+
+    # Notifications, lock screens and launchers are layer-shell surfaces.
+    # They are on the output and in the picture, and never in the window
+    # list.
+    probed, layers = visible_layers(monitor)
+    if not probed:
+        return "overlay list unknown", "", app
+    rule = blocked_layer(cfg, layers)
+    if rule:
+        return "blocked", rule, app
+
+    # Last, because it is the slowest probe and the most consequential, so
+    # its answer is the freshest thing in the frame.
+    locked = session_locked()
+    if locked is None:
+        return "lock state unknown", "", app
+    if locked:
+        return "locked", "", app
+    return "", "", app
 
 
 def capture(monitor):
@@ -1401,6 +1520,9 @@ def disk_usage(conn):
 BOOTSTRAP_FRAME_BYTES = 88 * 1024   # measured: 1280x800 WebP at quality 60
 BOOTSTRAP_KEEP_RATIO = 0.15         # measured: dedup kept ~2 of 16 idle ticks
 ASSUMED_ACTIVE_HOURS = 8.0          # a working day, until we can count one
+# However long a tick overran, the next one still waits: a loop with no
+# floor under its sleep is a loop that spawns without limit under load.
+MIN_SLEEP = 0.5
 GAP_CEILING = 300.0                 # a gap longer than this is away, not usage
 MIN_SAMPLE_FRAMES = 60
 # Half an hour of real use before the estimate trusts itself. Two minutes of
@@ -1659,6 +1781,13 @@ class Recorder:
             self.coverage_at = now
         return self.coverage_cache
 
+    def refuse(self, reason, rule=""):
+        """Say why no frame was taken, naming the rule when one matched."""
+        if rule:
+            self.emit(reason=reason, capturing=False, blockedBy=rule)
+        else:
+            self.emit(reason=reason, capturing=False)
+
     def emit(self, **extra):
         frames, total = usage(self.conn)
         today = time.strftime("%Y-%m-%d")
@@ -1727,40 +1856,11 @@ class Recorder:
             self.emit(reason="screen off", capturing=False)
             return
 
-        probed, app, title = active_window()
-        if not probed:
-            self.emit(reason="focused window unknown", capturing=False)
-            return
-
-        # grim hands back the whole output, so every window on it matters.
-        probed, windows = visible_windows(monitor)
-        if not probed:
-            self.emit(reason="window list unknown", capturing=False)
-            return
-        seen_layers, layers = visible_layers(monitor)
-        if not seen_layers:
-            self.emit(reason="overlay list unknown", capturing=False)
-            return
-
-        rule = ""
-        for other_app, other_title in windows + [(app, title)]:
-            rule = blocked_by(self.cfg, other_app, other_title)
-            if rule:
-                break
-        if not rule:
-            rule = blocked_layer(self.cfg, layers)
-        if rule:
-            # The frame is never taken. Nothing to delete later, because
-            # nothing existed.
-            self.emit(reason="blocked", capturing=False, blockedBy=rule)
-            return
-
-        locked = session_locked()
-        if locked is None:
-            self.emit(reason="lock state unknown", capturing=False)
-            return
-        if locked:
-            self.emit(reason="locked", capturing=False)
+        # The frame is never taken when this refuses, so there is nothing to
+        # delete afterwards, because nothing existed.
+        reason, rule, app = capture_gate(self.cfg, monitor)
+        if reason:
+            self.refuse(reason, rule)
             return
 
         ppm, err = capture(monitor)
@@ -1783,26 +1883,9 @@ class Recorder:
         # still only in memory here, so it costs nothing to drop it. Paid
         # once per kept frame rather than once per tick, because change
         # detection has already discarded the rest.
-        still_locked = session_locked()
-        if still_locked is not False:
-            self.emit(reason="locked", capturing=False)
-            return
-        seen_after, layers_after = visible_layers(monitor)
-        if not seen_after:
-            self.emit(reason="overlay list unknown", capturing=False)
-            return
-        late = blocked_layer(self.cfg, layers_after)
-        if not late:
-            seen_now, windows_now = visible_windows(monitor)
-            if not seen_now:
-                self.emit(reason="window list unknown", capturing=False)
-                return
-            for other_app, other_title in windows_now:
-                late = blocked_by(self.cfg, other_app, other_title)
-                if late:
-                    break
-        if late:
-            self.emit(reason="blocked", capturing=False, blockedBy=late)
+        reason, rule, _ = capture_gate(self.cfg, monitor)
+        if reason:
+            self.refuse(reason, rule)
             return
 
         webp, err = encode_webp(ppm, self.cfg["quality"])
@@ -1856,9 +1939,11 @@ class Recorder:
                 log("database error: %s" % exc)
             except Exception as exc:
                 log("tick failed: %s" % exc)
+            # A tick that overran its interval used to sleep for nothing at
+            # all, so a compositor answering slowly turned the loop into a
+            # subprocess storm exactly when the machine could least take one.
             delay = self.cfg["interval"] - (time.time() - started)
-            if delay > 0:
-                self.stop.wait(delay)
+            self.stop.wait(max(delay, MIN_SLEEP))
         try:
             self.jobs.put_nowait(None)
         except queue.Full:
@@ -2124,23 +2209,18 @@ def cmd_doctor(_args):
     # doctor used to screenshot unconditionally, so running it while the
     # session was locked, paused, or showing a blocked window took exactly the
     # frame the plugin promises never to take.
-    blocked = ""
-    if probed and monitor:
-        seen, windows = visible_windows(monitor)
-        for other_app, other_title in (windows if seen else []):
-            blocked = blocked_by(cfg, other_app, other_title) or blocked
-        seen_layers, layers = visible_layers(monitor)
-        if seen_layers:
-            blocked = blocked_layer(cfg, layers) or blocked
     refuse = ""
     if os.path.exists(PAUSE_MARKER):
         refuse = "paused"
-    elif session_locked() is not False:
-        refuse = "the session is locked, or cannot be asked"
-    elif not probed or not awake:
+    elif not probed or not monitor or not awake:
         refuse = "the display is off, or cannot be asked"
-    elif blocked:
-        refuse = "a blocked window is on screen (%s)" % blocked
+    else:
+        # The same gate the recorder uses, refusing for the same reasons.
+        reason, rule, _ = capture_gate(cfg, monitor)
+        if rule:
+            refuse = "a blocked window is on screen (%s)" % rule
+        elif reason:
+            refuse = reason
     if refuse:
         check("capture", True, "not attempted: %s" % refuse)
     else:

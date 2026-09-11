@@ -126,7 +126,11 @@ This plugin exists to remember your screen, so it is built to be told no.
 - **A visible indicator.** The bar icon shows `󰑊` while recording and `󰏤`
   while paused. It is never ambiguous about what it is doing.
 - **Locked and asleep screens are skipped**, as is a monitor whose DPMS is off,
-  and so is the screensaver: idle time is not a memory worth keeping.
+  and so is the screensaver: idle time is not a memory worth keeping. The lock
+  is read from the compositor rather than from logind, because Omarchy locks
+  with a session-lock surface drawn by the shell itself: there is no locker
+  process to find by name, and nothing sets logind's `LockedHint`, which
+  answers "not locked" for the whole time the screen is locked.
 - **Names are never trusted.** Permissions are repaired through file
   descriptors opened with `O_NOFOLLOW`, so a symlink planted in the archive
   cannot redirect a `chmod` onto something else. Deletion walks into the
@@ -193,8 +197,10 @@ entirely; removing the key restores the defaults.
   "blocklist": ["1password", "bitwarden", "keepassxc", "keepass",
                 "gnome-keyring", "seahorse", "private browsing", "incognito",
                 "inprivate", "screensaver", "org.omarchy.screensaver"],
-  "blocklistLayers": ["mako", "swaync", "dunst", "fnott", "notifications",
-                      "swaylock", "hyprlock", "wlogout", "rofi", "fuzzel",
+  "blocklistLayers": ["mako", "swaync", "dunst", "fnott",
+                      "notifications", "notification",
+                      "swaylock", "hyprlock", "lockscreen", "wlogout",
+                      "rofi", "fuzzel", "launcher",
                       "wofi", "anyrun", "tofi"],
   "blocklistTitles": []
 }
@@ -212,7 +218,7 @@ Frames and the index live in `~/.local/share/omarchy-hindsight/`.
 python3 tests/test-index.py
 ```
 
-193 offline checks covering the hashing, the blocklist, query sanitising, the
+216 offline checks covering the hashing, the blocklist, query sanitising, the
 search round trip, ring-buffer pruning, age retention, index migration, and the
 frame-vanished-under-the-backfill case — none of which need a screen.
 

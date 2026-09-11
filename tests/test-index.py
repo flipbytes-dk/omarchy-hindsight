@@ -468,19 +468,46 @@ check("no named locker plus no loginctl answer is still unknown",
       with_run(answered_no, hs.session_locked) is None,
       with_run(answered_no, hs.session_locked))
 
-def says_unlocked(cmd, **kwargs):
-    if cmd[0] == "pgrep":
-        return 1, b"", b""
-    return 0, b"no", b""
-check("only an explicit loginctl 'no' means unlocked",
-      with_run(says_unlocked, hs.session_locked) is False)
+# Omarchy locks with an ext-session-lock surface drawn by the shell process
+# that is already running. There is no locker to find by name, and nothing
+# sets LockedHint - the session answers "no" for the whole time the screen is
+# locked. Believing that "no" recorded the locked screen. The compositor is
+# asked first now, and logind's "no" can no longer grant permission on its
+# own.
+def hypr(blockers, hint=b"no", hyprctl_ok=True):
+    def fake(cmd, **kwargs):
+        if cmd[0] == "hyprctl":
+            if not hyprctl_ok:
+                return 1, b"", b"gone"
+            mon = {"name": "DP-1", "focused": True}
+            if blockers is not None:
+                mon["solitaryBlockedBy"] = blockers
+            return 0, _json.dumps([mon]).encode(), b""
+        if cmd[0] == "pgrep":
+            return 1, b"", b""      # no locker by that name: a real answer
+        return 0, hint, b""
+    return fake
 
-def says_locked(cmd, **kwargs):
-    if cmd[0] == "pgrep":
-        return 1, b"", b""
-    return 0, b"yes", b""
-check("loginctl reporting a locked session is believed",
-      with_run(says_locked, hs.session_locked) is True)
+check("a lock the compositor holds is locked, whatever logind answers",
+      with_run(hypr(["LOCK"]), hs.session_locked) is True,
+      with_run(hypr(["LOCK"]), hs.session_locked))
+check("and a compositor with no lock among its blockers is unlocked",
+      with_run(hypr(["WINDOWED", "CANDIDATE"]), hs.session_locked) is False)
+# Hyprland stops at the first reason, so a monitor still waiting for a
+# workspace was never asked about the lock at all.
+check("a monitor with no workspace yet is unknown, not unlocked",
+      with_run(hypr(["WORKSPACE"]), hs.session_locked) is None,
+      with_run(hypr(["WORKSPACE"]), hs.session_locked))
+check("a compositor too old to report the field is unknown, not unlocked",
+      with_run(hypr(None), hs.session_locked) is None)
+check("loginctl reporting a locked session is believed when the compositor "
+      "cannot be asked",
+      with_run(hypr(None, hint=b"yes", hyprctl_ok=False),
+               hs.session_locked) is True)
+check("and its 'no' alone is not permission to record",
+      with_run(hypr(None, hint=b"no", hyprctl_ok=False),
+               hs.session_locked) is None,
+      with_run(hypr(None, hint=b"no", hyprctl_ok=False), hs.session_locked))
 
 # The gate itself: a recorder whose probes all fail must not reach capture.
 captured = []
@@ -707,8 +734,12 @@ check("a locked session is not masked by the systemd user manager",
 check("the manager session is not asked at all",
       "2" not in with_run(sessions(two, {}), hs.login_sessions),
       with_run(sessions(two, {}), hs.login_sessions))
-check("every session saying no means unlocked",
-      with_run(sessions(two, {"5": "no"}), hs.session_locked) is False)
+# This used to assert False. It was the bug: with no compositor to ask, a
+# desktop whose sessions all answer "no" has told us nothing, because nothing
+# writes that field. Unknown, and unknown does not capture.
+check("every session saying no, with no compositor to ask, is still unknown",
+      with_run(sessions(two, {"5": "no"}), hs.session_locked) is None,
+      with_run(sessions(two, {"5": "no"}), hs.session_locked))
 
 blind = [{"name": "DP-1", "activeWorkspace": None, "specialWorkspace": None}]
 one_client = [{"class": "1Password", "title": "V", "workspace": {"id": 1},
@@ -1037,7 +1068,16 @@ for namespace, want in (
         ("swaync-control-center", True), ("swaync_control_center", True),
         ("dunst_popup", True), ("mako.surface", True),
         ("org.freedesktop.Notifications", True), ("ags-notifications", True),
-        ("eww-notifications-bar", False), ("my-notifications-widget", False),
+        ("eww-notifications-bar", False),
+    ("quickshell:notifications", True),
+    ("shell/notifications", True),
+    ("notification-popups", True),
+    ("notification-center", True),
+    ("launcher", True),
+    ("lockscreen", True),
+    # Accepted, and documented rather than wished away: a bar that names
+    # itself after what it holds is indistinguishable from a daemon.
+    ("notifications-bar", True), ("my-notifications-widget", False),
         ("omarchy-bar", False), ("omarchy-background", False)):
     got = bool(hs.blocked_layer(hs.DEFAULTS, [namespace]))
     check("%-32s %s" % (namespace, "blocks" if want else "does not block"),
@@ -1083,6 +1123,120 @@ check("a screen locked between the gate and the shutter drops the frame",
       "encoded=%s" % late_seen)
 check("and the lock was asked again after the capture", calls["lock"] == 2,
       calls["lock"])
+
+
+print("\n-- one gate, and every probe that cannot answer refuses --")
+# Each row silences one probe and leaves the rest clear. The frame must be
+# refused for every one of them: a probe that cannot answer is not a probe
+# that said yes. Table-driven so a probe added to capture_gate without a
+# fail-closed branch fails here rather than in the field.
+CLEAR = {
+    "active_window": lambda: (True, "ghostty", "work"),
+    "visible_windows": lambda m: (True, [("ghostty", "work")]),
+    "visible_layers": lambda m: (True, []),
+    "session_locked": lambda: False,
+}
+MUTE = {
+    "active_window": ((lambda: (False, "", "")), "focused window unknown"),
+    "visible_windows": ((lambda m: (False, [])), "window list unknown"),
+    "visible_layers": ((lambda m: (False, [])), "overlay list unknown"),
+    "session_locked": ((lambda: None), "lock state unknown"),
+}
+saved3 = {k: getattr(hs, k) for k in CLEAR}
+try:
+    for probe, (mute, want) in sorted(MUTE.items()):
+        for name, fn in CLEAR.items():
+            setattr(hs, name, fn)
+        setattr(hs, probe, mute)
+        reason, rule, _ = hs.capture_gate(dict(hs.DEFAULTS), "DP-1")
+        check("a silent %s refuses the frame" % probe, reason == want,
+              "reason=%r rule=%r" % (reason, rule))
+    for name, fn in CLEAR.items():
+        setattr(hs, name, fn)
+    reason, rule, app = hs.capture_gate(dict(hs.DEFAULTS), "DP-1")
+    check("and an answered, clear screen is captured",
+          reason == "" and rule == "" and app == "ghostty",
+          "reason=%r rule=%r app=%r" % (reason, rule, app))
+    # A blocked overlay must be named, not merely refused: the panel shows
+    # the rule so the user can see why the recorder went quiet.
+    hs.visible_layers = lambda m: (True, ["swaync-control-center"])
+    reason, rule, _ = hs.capture_gate(dict(hs.DEFAULTS), "DP-1")
+    check("a blocked overlay is refused and named",
+          reason == "blocked" and rule == "swaync", "%r %r" % (reason, rule))
+finally:
+    for name, fn in saved3.items():
+        setattr(hs, name, fn)
+
+
+print("\n-- doctor refuses on the same terms the recorder does --")
+# doctor takes a real screenshot, so it needs the recorder's gate, not a
+# copy of it. It had one: the copy treated a probe that could not answer as
+# a clear screen, and photographed whatever was on it.
+shots = []
+saved4 = {k: getattr(hs, k) for k in
+          ("active_window", "visible_windows", "visible_layers",
+           "session_locked", "focused_monitor", "capture")}
+try:
+    hs.capture = lambda m: (shots.append(m), (ppm(4, 4, lambda x, y: (0, 0, 0)), ""))[1]
+    hs.focused_monitor = lambda: (True, "DP-1", True)
+    for probe, (mute, _want) in sorted(MUTE.items()):
+        for name, fn in CLEAR.items():
+            setattr(hs, name, fn)
+        setattr(hs, probe, mute)
+        shots[:] = []
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            hs.cmd_doctor(None)
+        report = _json.loads(buf.getvalue())
+        detail = [c for c in report["checks"] if c["name"] == "capture"][0]
+        check("doctor takes no picture when %s is silent" % probe,
+              not shots and detail["detail"].startswith("not attempted"),
+              "shots=%s detail=%r" % (shots, detail["detail"]))
+    # And a blocked window, which is the case doctor already handled.
+    for name, fn in CLEAR.items():
+        setattr(hs, name, fn)
+    hs.visible_layers = lambda m: (True, ["mako"])
+    shots[:] = []
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        hs.cmd_doctor(None)
+    check("doctor takes no picture while a notification is up", not shots,
+          shots)
+finally:
+    for name, fn in saved4.items():
+        setattr(hs, name, fn)
+
+# The point of the refactor: both callers ask the same function, so a gate
+# cannot be added to one and forgotten in the other.
+gate_calls = []
+real_gate = hs.capture_gate
+hs.capture_gate = lambda cfg, m: (gate_calls.append(m), ("paused", "", ""))[1]
+saved5 = (hs.focused_monitor, hs.capture)
+try:
+    hs.focused_monitor = lambda: (True, "DP-1", True)
+    hs.capture = lambda m: (None, "should not be reached")
+    g5 = hs.Recorder.__new__(hs.Recorder)
+    g5.cfg = dict(hs.DEFAULTS)
+    g5.cfg_stamp = hs.config_stamp()
+    g5.conn = hs.connect()
+    g5.emitted = None
+    g5.dropped_ocr = 0
+    g5.last_hash = None
+    g5.coverage_cache = {"coverageDays": 0, "coverageText": "",
+                         "coverageBasis": "default"}
+    g5.coverage_at = time.time()
+    g5.jobs = __import__("queue").Queue(maxsize=4)
+    g5.tick()
+    tick_calls = len(gate_calls)
+    with contextlib.redirect_stdout(io.StringIO()):
+        hs.cmd_doctor(None)
+    check("the recorder and doctor ask the one gate",
+          tick_calls >= 1 and len(gate_calls) > tick_calls,
+          "tick=%d doctor=%d" % (tick_calls, len(gate_calls) - tick_calls))
+finally:
+    hs.capture_gate = real_gate
+    (hs.focused_monitor, hs.capture) = saved5
+
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 if FAIL:
