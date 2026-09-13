@@ -1336,6 +1336,149 @@ check("and reports no removal for the file it refused", swept_link == 0,
 check("so a refused file does not keep re-triggering the sweep",
       hs.sweep_orphans(conn_o) == 0 and os.path.lexists(link))
 
+print("\n-- what a helper hands back is bounded --")
+import resource
+
+# These run real processes. The whole point is that a fake subprocess cannot
+# show a deadlock, a leaked descriptor or a surviving grandchild.
+
+check("returns a helper's output and its exit code",
+      hs.run(["sh", "-c", "printf hello"]) == (0, b"hello", b""))
+check("passes a failure through with its stderr",
+      hs.run(["sh", "-c", "printf oops >&2; exit 3"]) == (3, b"", b"oops"))
+check("reports a helper that is not installed",
+      hs.run(["hindsight-no-such-binary"])[0] == hs.RUN_MISSING)
+
+# A pipe holds 64 KB. Writing 8 MB into one while the child writes 8 MB back
+# deadlocks anything that does not drain both ends at once - which is the
+# shape of every frame this program pipes through magick and tesseract.
+big = b"x" * (8 * 1024 * 1024)
+code, out, _ = hs.run(["cat"], timeout=30, stdin_bytes=big, limit=16 * 1024 * 1024)
+check("pushes more into a helper than a pipe buffer holds", code == 0, code)
+check("and gets every byte back", out == big, len(out))
+
+started = time.time()
+code, out, err = hs.run(["cat", "/dev/zero"], timeout=30, limit=1024 * 1024)
+elapsed = time.time() - started
+check("stops a helper that writes past its ceiling", code == hs.RUN_OVERFLOW, code)
+check("and keeps none of what it wrote", out == b"", len(out))
+check("and says so in stderr", b"over" in err, err)
+# The timeout is not the bound. A 4K frame grabber can produce gigabytes in
+# well under ten seconds, and by then the memory is already gone.
+check("and does not wait out the timeout to do it", elapsed < 10, elapsed)
+
+before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+hs.run(["cat", "/dev/zero"], timeout=30, limit=4 * 1024 * 1024)
+grew = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - before
+check("and never holds more than the ceiling while draining",
+      grew < 32 * 1024, "%d KB" % grew)
+
+code, out, err = hs.run(
+    ["sh", "-c", "head -c 4000000 /dev/zero >&2; printf done"], timeout=30)
+check("caps stderr too", len(err) <= hs.CAP_STDERR, len(err))
+check("without losing stdout", out == b"done", out)
+
+code, _, _ = hs.run(["sleep", "30"], timeout=0.5)
+check("stops a helper that runs past its timeout", code == hs.RUN_TIMEOUT, code)
+
+# magick forks delegates and tesseract forks workers. Signalling only the
+# child leaves those holding the pipe open and still writing.
+pidfile = os.path.join(TMP, "grandchild.pid")
+hs.run(["sh", "-c", "sleep 30 & echo $! > %s; wait" % pidfile], timeout=1)
+gpid = int(io.open(pidfile).read().strip())
+alive = True
+for _ in range(60):
+    try:
+        os.kill(gpid, 0)
+    except OSError:
+        alive = False
+        break
+    time.sleep(0.05)
+check("kills the whole process group, not just the child it started",
+      not alive, gpid)
+
+fds = os.path.join("/proc", str(os.getpid()), "fd")
+open_before = len(os.listdir(fds))
+for _ in range(15):
+    hs.run(["sh", "-c", "printf hi"])
+    hs.run(["sleep", "30"], timeout=0.2)
+    hs.run(["cat", "/dev/zero"], timeout=30, limit=64 * 1024)
+open_after = len(os.listdir(fds))
+check("leaks no descriptors across kills and timeouts",
+      open_after <= open_before + 2, (open_before, open_after))
+
+print("\n-- a frame is whole or it is not stored --")
+
+whole = ppm(8, 4, lambda x, y: (1, 2, 3))
+check("accepts a complete P6 frame", hs.ppm_complete(whole))
+check("rejects one cut short", not hs.ppm_complete(whole[:-1]))
+check("keeps one with a byte trailing the pixels", hs.ppm_complete(whole + b"\x00"))
+check("rejects a buffer that is not a PPM", not hs.ppm_complete(b"\x89PNG\r\n\x1a\n"))
+check("rejects a header with no pixels behind it",
+      not hs.ppm_complete(b"P6\n8 4\n255\n"))
+check("skips a comment in the header",
+      hs.ppm_complete(b"P6\n# grim wrote this\n8 4\n255\n" + b"\x00" * 96))
+check("counts two bytes a channel when maxval needs them",
+      hs.ppm_complete(b"P6\n2 2\n65535\n" + b"\x00" * 24))
+check("a ceiling large enough for an 8K frame",
+      hs.CAP_PPM > 7680 * 4320 * 3, hs.CAP_PPM)
+check("rejects a dimension too long to be real",
+      not hs.ppm_complete(b"P6\n999999999 1\n255\n"))
+
+# A killed grim still returns everything it managed to write. Half a frame
+# decodes cleanly into a picture of the top of the screen, and would be
+# stored, OCR'd and searchable like any other.
+half = whole[:len(whole) // 2]
+check("capture refuses a truncated frame",
+      with_run(lambda *a, **k: (0, half, b""), lambda: hs.capture(None))
+      == (None, "incomplete frame from grim"))
+check("and accepts a whole one",
+      with_run(lambda *a, **k: (0, whole, b""), lambda: hs.capture(None))
+      == (whole, ""))
+
+check("accepts a whole RIFF/WEBP file",
+      hs.webp_complete(b"RIFF" + (12).to_bytes(4, "little") + b"WEBPVP8 abcd"))
+check("rejects one cut short",
+      not hs.webp_complete(b"RIFF" + (12).to_bytes(4, "little") + b"WEBPVP8 abc"))
+check("keeps one with a byte trailing the payload",
+      hs.webp_complete(b"RIFF" + (12).to_bytes(4, "little") + b"WEBPVP8 abcde"))
+check("rejects a buffer that is not a RIFF container",
+      not hs.webp_complete(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8))
+check("the encoder refuses a truncated WebP",
+      with_run(lambda *a, **k: (0, b"RIFF" + (99).to_bytes(4, "little") + b"WEBPxx", b""),
+               lambda: hs.encode_webp(whole, 60))
+      == (None, "incomplete frame from magick"))
+
+real_read = hs.read_frame_bytes
+hs.read_frame_bytes = lambda path: b"webp-bytes"
+try:
+    decode = lambda body: (lambda cmd, **k:
+                           (0, body, b"") if cmd[0] == "magick" else (0, b"words", b""))
+    check("OCR refuses a half-decoded frame",
+          with_run(decode(half), lambda: hs.ocr_frame_file("x", 30)) is None)
+    check("and reads a whole one",
+          with_run(decode(whole), lambda: hs.ocr_frame_file("x", 30)) == "words")
+finally:
+    hs.read_frame_bytes = real_read
+
+caps = {}
+
+def record_cap(cmd, **kwargs):
+    # A probe takes the default, so read it the way run() would.
+    caps[cmd[0]] = kwargs.get("limit", hs.CAP_PROBE)
+    return 0, whole, b""
+
+with_run(record_cap, lambda: hs.capture(None))
+with_run(record_cap, lambda: hs.encode_webp(whole, 60))
+with_run(record_cap, lambda: hs.ocr_text(whole, 30))
+with_run(record_cap, hs.active_window)
+import inspect
+check("an unlabelled call still gets the probe ceiling",
+      inspect.signature(real_run).parameters["limit"].default == hs.CAP_PROBE)
+check("every stage names its own ceiling",
+      (caps.get("grim"), caps.get("magick"), caps.get("nice"), caps.get("hyprctl"))
+      == (hs.CAP_PPM, hs.CAP_WEBP, hs.CAP_OCR, hs.CAP_PROBE), caps)
+
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 if FAIL:
     print("failed: " + ", ".join(FAIL))

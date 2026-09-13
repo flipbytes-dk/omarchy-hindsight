@@ -74,6 +74,13 @@ An unchanged screen costs only the first two steps, so an idle desktop is
 nearly free and stores nothing at all. Frames are kept in a ring buffer inside
 a size budget you set; the oldest go first.
 
+Memory stays flat because every helper has a ceiling. Hindsight drains the
+pipes from `grim`, `magick` and `tesseract` as they fill, and kills a helper
+that writes past its ceiling (128 MB of raw pixels, 32 MB of WebP, 4 MB of
+text) along with anything it started. Nothing waits for the timeout to notice,
+so resident memory does not grow with the size of your display or the length
+of the session.
+
 ## How far back it reaches is your call
 
 Disk is the only limit, and you set it — in the panel, or from the shell. The
@@ -156,6 +163,11 @@ This plugin exists to remember your screen, so it is built to be told no.
   frame is not taken. A blocklist is worth no more than the probe behind it,
   so a timed-out `hyprctl` costs you a gap in the archive rather than a
   recorded password.
+- **A frame is whole or it never lands.** A frame grabber killed halfway
+  through still hands back what it wrote, and half a screenshot decodes into a
+  readable picture of the top of your screen. The PPM and the WebP each state
+  their own length in their header, so Hindsight drops a frame whose bytes do
+  not match before anything stores, reads or searches it.
 - **Forget.** `bin/hindsight forget today`, a specific day, or `all`. The
   archive is swept for frames the index does not know about, so a frame whose
   row never landed cannot outlive a `forget all` by hiding from it.
@@ -220,9 +232,12 @@ Frames and the index live in `~/.local/share/omarchy-hindsight/`.
 python3 tests/test-index.py
 ```
 
-226 offline checks covering the hashing, the blocklist, query sanitising, the
-search round trip, ring-buffer pruning, age retention, index migration, and the
-frame-vanished-under-the-backfill case — none of which need a screen.
+260 offline checks covering the hashing, the blocklist, query sanitising, the
+search round trip, ring-buffer pruning, age retention, index migration, the
+frame-vanished-under-the-backfill case, and the helper ceilings — none of which
+need a screen. The ceiling checks run real processes, because a stubbed
+subprocess cannot show a deadlock, a leaked descriptor or a surviving
+grandchild.
 
 ## License
 

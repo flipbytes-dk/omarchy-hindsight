@@ -16,6 +16,7 @@ import math
 import os
 import queue
 import re
+import selectors
 import shutil
 import signal
 import sqlite3
@@ -720,17 +721,191 @@ def distance(a, b):
 # desktop probes
 
 
-def run(cmd, timeout=5, stdin_bytes=None):
+# How much each helper is allowed to hand back. These are allocations inside a
+# process that stays up for weeks, so a timeout is not a bound: by the time it
+# fires the memory is already gone. Every stage states its own ceiling.
+PIPE_CHUNK = 64 * 1024
+CAP_STDERR = 64 * 1024                 # diagnostics, never data
+CAP_PROBE = 4 * 1024 * 1024            # hyprctl and loginctl JSON
+CAP_PPM = 128 * 1024 * 1024            # raw RGB; an 8K frame is 99.5 MB of it
+CAP_WEBP = 32 * 1024 * 1024            # one encoded frame
+CAP_OCR = 4 * 1024 * 1024              # the words on one screen
+
+# run() adds these to whatever the child itself exits with.
+RUN_TIMEOUT = 124
+RUN_OVERFLOW = 125
+RUN_MISSING = 127
+
+
+def kill_group(proc):
+    """Kill `proc` and anything it started, then reap it.
+
+    The child got its own process group, so one signal reaches the delegates
+    ImageMagick forks and whatever tesseract spawns. Signalling the process
+    alone leaves those children holding the pipe open and still writing."""
     try:
-        proc = subprocess.run(
-            cmd, capture_output=True, timeout=timeout, input=stdin_bytes)
-        return proc.returncode, proc.stdout, proc.stderr
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
+def run(cmd, timeout=5, stdin_bytes=None, limit=CAP_PROBE):
+    """(code, stdout, stderr), holding at most `limit` bytes of stdout.
+
+    subprocess.run(capture_output=True) buffers whatever the child decides to
+    write and only stops it on the clock. A frame grabber pointed at a huge
+    display, or a helper gone haywire, can hand back gigabytes long before a
+    10 second timeout expires, and the recorder holding that allocation is the
+    one process on the system that must never die.
+
+    So both pipes are drained incrementally and the child is killed the moment
+    stdout passes `limit`. Overflow and timeout both return empty stdout:
+    half a JSON document, or the top third of a screenshot, is not a smaller
+    answer than the whole one, it is a wrong answer that looks usable.
+
+    `limit` bounds what this holds while the child runs. Handing the result
+    back copies it once, so the peak is twice the ceiling for as long as that
+    copy takes. Real frames are 3 MB against a 128 MB ceiling; the ceiling is
+    there to stop a helper that has lost its mind, not to fit one."""
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE if stdin_bytes else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True)
     except FileNotFoundError:
-        return 127, b"", b"missing"
-    except subprocess.TimeoutExpired:
-        return 124, b"", b"timeout"
+        return RUN_MISSING, b"", b"missing"
     except Exception as exc:
         return 1, b"", str(exc).encode()
+
+    out = bytearray()
+    err = bytearray()
+    pending = memoryview(stdin_bytes) if stdin_bytes else None
+    written = 0
+    deadline = time.monotonic() + timeout
+    overflow = False
+    expired = False
+    sel = selectors.DefaultSelector()
+
+    try:
+        if pending is not None:
+            os.set_blocking(proc.stdin.fileno(), False)
+            sel.register(proc.stdin, selectors.EVENT_WRITE)
+        for pipe in (proc.stdout, proc.stderr):
+            os.set_blocking(pipe.fileno(), False)
+            sel.register(pipe, selectors.EVENT_READ)
+
+        while sel.get_map() and not overflow:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                expired = True
+                break
+            for key, events in sel.select(min(left, 0.5)):
+                pipe = key.fileobj
+                if events & selectors.EVENT_WRITE:
+                    try:
+                        written += os.write(
+                            pipe.fileno(), pending[written:written + PIPE_CHUNK])
+                    except BlockingIOError:
+                        continue
+                    except OSError:
+                        # The child stopped reading. Its own exit code says why.
+                        sel.unregister(pipe)
+                        pipe.close()
+                        continue
+                    if written >= len(pending):
+                        sel.unregister(pipe)
+                        pipe.close()
+                    continue
+                try:
+                    chunk = os.read(pipe.fileno(), PIPE_CHUNK)
+                except (BlockingIOError, InterruptedError):
+                    continue               # nothing ready yet
+                except OSError:
+                    sel.unregister(pipe)
+                    continue
+                if not chunk:              # EOF
+                    sel.unregister(pipe)
+                    continue
+                if pipe is proc.stdout:
+                    out += chunk
+                    if len(out) > limit:
+                        overflow = True
+                        break
+                elif len(err) < CAP_STDERR:
+                    err += chunk[:CAP_STDERR - len(err)]
+
+        if overflow or expired:
+            kill_group(proc)
+            if overflow:
+                return RUN_OVERFLOW, b"", b"output over %d bytes" % limit
+            return RUN_TIMEOUT, b"", b"timeout"
+
+        try:
+            proc.wait(timeout=max(deadline - time.monotonic(), 0.1))
+        except subprocess.TimeoutExpired:
+            kill_group(proc)
+            return RUN_TIMEOUT, b"", b"timeout"
+        return proc.returncode, bytes(out), bytes(err)
+    except Exception as exc:
+        kill_group(proc)
+        return 1, b"", str(exc).encode()
+    finally:
+        sel.close()
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+            if pipe is not None and not pipe.closed:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+        if proc.poll() is None:
+            kill_group(proc)
+
+
+def ppm_complete(data):
+    """True when `data` is a whole P6 image rather than the start of one.
+
+    A killed grim or magick still returns everything it managed to write, and
+    a half-written frame decodes into a picture of the top of your screen with
+    grey below it - stored, OCR'd and searchable like any other. The header
+    states the dimensions, so the byte count is known, and anything shorter
+    gets dropped rather than kept.
+
+    Anything longer is kept. A build of grim or magick that appends a byte is
+    not the failure this guards against, and refusing it would stop capture on
+    that machine altogether."""
+    if not data.startswith(b"P6"):
+        return False
+    fields = []
+    at = 2
+    while len(fields) < 3:
+        while at < len(data) and data[at:at + 1].isspace():
+            at += 1
+        if data[at:at + 1] == b"#":
+            while at < len(data) and data[at] != 0x0A:
+                at += 1
+            continue
+        start = at
+        while at < len(data) and data[at:at + 1].isdigit():
+            at += 1
+        if at == start or at - start > 8:
+            return False
+        fields.append(int(data[start:at]))
+    if not data[at:at + 1].isspace():
+        return False
+    width, height, maxval = fields
+    if width <= 0 or height <= 0 or not 0 < maxval <= 65535:
+        return False
+    depth = 1 if maxval < 256 else 2
+    return len(data) - (at + 1) >= width * height * 3 * depth
 
 
 def active_window():
@@ -1145,24 +1320,41 @@ def capture(monitor):
     if monitor:
         cmd += ["-o", monitor]
     cmd.append("-")
-    code, out, err = run(cmd, timeout=10)
+    code, out, err = run(cmd, timeout=10, limit=CAP_PPM)
     if code != 0 or not out:
         return None, err.decode("utf-8", "replace").strip()
+    if not ppm_complete(out):
+        return None, "incomplete frame from grim"
     return out, ""
 
 
 def encode_webp(ppm, quality):
     code, out, err = run(
         ["magick", "ppm:-", "-quality", str(quality), "webp:-"],
-        timeout=20, stdin_bytes=ppm)
+        timeout=20, stdin_bytes=ppm, limit=CAP_WEBP)
     if code != 0 or not out:
         return None, err.decode("utf-8", "replace").strip()
+    if not webp_complete(out):
+        return None, "incomplete frame from magick"
     return out, ""
 
 
 # 0 not read yet, 1 read, 2 read but unreadable image, 3 no OCR tool -
 # 3 is retried, because installing tesseract should heal the archive.
 OCR_PENDING, OCR_DONE, OCR_DONE_UNREADABLE, OCR_TOOL_MISSING = 0, 1, 2, 3
+
+
+def webp_complete(data):
+    """True when `data` is a whole RIFF/WEBP file.
+
+    The RIFF header states the payload length, so an encoder killed mid-write
+    is caught by the same arithmetic that catches a truncated PPM, before the
+    half-written frame reaches the archive. Short is the failure here; long is
+    somebody else's chunk."""
+    if len(data) < 12 or not data.startswith(b"RIFF") or data[8:12] != b"WEBP":
+        return False
+    size = int.from_bytes(data[4:8], "little")
+    return size >= 4 and len(data) >= size + 8
 
 
 def ocr_frame_file(path, timeout):
@@ -1175,15 +1367,17 @@ def ocr_frame_file(path, timeout):
     data = read_frame_bytes(path)
     if not data:
         return None
-    code, ppm, _ = run(["magick", "webp:-", "ppm:-"], timeout=20, stdin_bytes=data)
-    if code != 0 or not ppm:
+    code, ppm, _ = run(["magick", "webp:-", "ppm:-"], timeout=20,
+                       stdin_bytes=data, limit=CAP_PPM)
+    if code != 0 or not ppm or not ppm_complete(ppm):
         return None
     return ocr_text(ppm, timeout)
 
 
 def ocr_text(ppm, timeout):
     code, out, _ = run(["nice", "-n", "19", "tesseract", "-", "stdout",
-                        "--psm", "6"], timeout=timeout, stdin_bytes=ppm)
+                        "--psm", "6"], timeout=timeout, stdin_bytes=ppm,
+                       limit=CAP_OCR)
     if code != 0:
         # None means "could not read", "" means "read it, no words on it".
         # Conflating them marked frames captured while tesseract was missing
