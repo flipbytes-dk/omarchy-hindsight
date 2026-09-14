@@ -56,15 +56,12 @@ Panel {
   // confirm you found the right moment.
   function copyCurrent() {
     if (!root.results || root.cursor >= root.results.length) return
-    // The id and the path both arrive as JSON from the helper, so neither is
-    // pasted into the command string. The id has to look like a plain number
-    // before it is used at all, and it reaches the shell as an argument
-    // rather than as text spliced into the script.
+    // No shell. The pipeline this replaced read $BASH_ENV before it ran a
+    // line of ours, and took python3 and wl-copy off the inherited PATH.
+    // The helper now holds the text and hands it to wl-copy itself.
     var id = Number(root.results[root.cursor].id)
     if (!isFinite(id) || id <= 0 || Math.floor(id) !== id) return
-    copier.command = ["sh", "-c",
-      "\"$1\" \"$2\" text \"$3\" | wl-copy",
-      "hindsight-copy", "python3", root.service.helperPath, String(id)]
+    copier.command = [root.service.helperPath, "copy", String(id)]
     copier.running = true
   }
 

@@ -1479,6 +1479,82 @@ check("every stage names its own ceiling",
       (caps.get("grim"), caps.get("magick"), caps.get("nice"), caps.get("hyprctl"))
       == (hs.CAP_PPM, hs.CAP_WEBP, hs.CAP_OCR, hs.CAP_PROBE), caps)
 
+print("\n-- a helper comes from where we say, with the environment we give it --")
+import stat as _stat
+
+check("resolves a helper to an absolute path under SAFE_PATH",
+      hs.tool("sh") in ("/usr/bin/sh", "/bin/sh", "/usr/bin/dash", "/bin/dash",
+                        "/usr/bin/bash", "/bin/bash"), hs.tool("sh"))
+check("gives the same answer twice without re-walking the path",
+      hs.tool("sh") == hs.tool("sh"))
+check("refuses a name that SAFE_PATH does not have",
+      hs.tool("hindsight-no-such-binary") is None)
+
+# The threat is a binary somebody else can replace, so the test plants one.
+planted = os.path.join(TMP, "planted")
+os.makedirs(planted, exist_ok=True)
+mine = os.path.join(planted, "grim")
+io.open(mine, "w").write("#!/bin/sh\necho not really grim\n")
+os.chmod(mine, 0o755)
+check("accepts a binary only we can write", hs.trusted_binary(mine) == mine,
+      hs.trusted_binary(mine))
+os.chmod(mine, 0o777)
+check("refuses one anybody can rewrite", hs.trusted_binary(mine) is None)
+os.chmod(mine, 0o755)
+os.chmod(planted, 0o777)
+check("refuses one in a directory anybody can write to",
+      hs.trusted_binary(mine) is None)
+os.chmod(planted, 0o755)
+check("refuses a directory", hs.trusted_binary(planted) is None)
+check("refuses a path that is not there",
+      hs.trusted_binary(os.path.join(planted, "absent")) is None)
+
+check("run() will not start an untrusted argv[0]",
+      hs.run(["hindsight-no-such-binary"]) == (hs.RUN_MISSING, b"",
+                                               b"no trusted hindsight-no-such-binary"))
+
+# A child that inherits the session environment inherits whatever was put
+# there to meet it: LD_PRELOAD, BASH_ENV, a PATH of somebody's choosing.
+os.environ["LD_PRELOAD"] = "/tmp/evil.so"
+os.environ["BASH_ENV"] = "/tmp/evil.sh"
+_real_path = os.environ.get("PATH", "")
+os.environ["PATH"] = "/tmp/evil-bin:" + _real_path
+try:
+    seen = dict(line.split("=", 1) for line in
+                hs.run(["env"], timeout=10)[1].decode().splitlines() if "=" in line)
+finally:
+    del os.environ["LD_PRELOAD"], os.environ["BASH_ENV"]
+    os.environ["PATH"] = _real_path
+check("a helper never sees LD_PRELOAD", "LD_PRELOAD" not in seen, seen.keys())
+check("or BASH_ENV", "BASH_ENV" not in seen, seen.keys())
+check("and gets the PATH we chose, not the one we were handed",
+      seen.get("PATH") == hs.SAFE_PATH, seen.get("PATH"))
+# ImageMagick reads a delegates file out of the home directory and runs what
+# it finds there. None of the five helpers needs a home to do its job.
+check("nor HOME", "HOME" not in seen, sorted(seen))
+check("while keeping what grim needs to find the compositor",
+      set(seen) <= {"PATH", "USER", "LANG", "LC_ALL", "XDG_RUNTIME_DIR",
+                    "XDG_SESSION_TYPE", "WAYLAND_DISPLAY",
+                    "HYPRLAND_INSTANCE_SIGNATURE", "PWD", "SHLVL", "_"},
+      sorted(seen))
+
+# wl-copy forks the clipboard owner and exits. Reading its pipes means waiting
+# for that child, which stays up as long as it serves the selection.
+started = time.time()
+hs.run(["sh", "-c", "sleep 2 & exit 0"], timeout=10, discard=True)
+quick = time.time() - started
+started = time.time()
+hs.run(["sh", "-c", "sleep 2 & exit 0"], timeout=10)
+held = time.time() - started
+check("discard returns when the helper exits, not when its daemon does",
+      quick < 1.0, quick)
+check("and reading the pipes would have waited for the daemon", held > 1.5, held)
+check("a discarded run still reports the helper's exit code",
+      hs.run(["sh", "-c", "exit 4"], timeout=5, discard=True)[0] == 4)
+
+check("copy wants a frame id", hs.cmd_copy([]) == 2)
+check("and refuses one that is not a number", hs.cmd_copy(["1; rm -rf /"]) == 2)
+
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 if FAIL:
     print("failed: " + ", ".join(FAIL))

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Hindsight - an always-on, local, searchable memory of your screen.
 
 Everything that can go wrong lives here rather than in QML: the capture loop,
@@ -731,6 +731,83 @@ CAP_PPM = 128 * 1024 * 1024            # raw RGB; an 8K frame is 99.5 MB of it
 CAP_WEBP = 32 * 1024 * 1024            # one encoded frame
 CAP_OCR = 4 * 1024 * 1024              # the words on one screen
 
+# Helpers are looked up here and nowhere else. An inherited PATH is a list of
+# directories chosen by whoever set the environment, and this program hands
+# the contents of the screen to the binaries it finds.
+SAFE_PATH = "/usr/local/bin:/usr/bin:/bin"
+
+# Resolved paths, once each. A miss is not cached: installing tesseract later
+# still has to heal the archive.
+_tools = {}
+_tools_lock = threading.Lock()
+
+
+def trusted_binary(path):
+    """The real path of `path`, or None when it is not safe to execute.
+
+    Safe means a regular file that neither group nor other can write, sitting
+    in a directory with the same property, owned by root or by us. Somebody
+    who can write either one can put their own grim there, and a grim of
+    somebody else's choosing is handed every frame of your screen."""
+    try:
+        real = os.path.realpath(path)
+        st = os.stat(real)
+    except OSError:
+        return None
+    if not statmod.S_ISREG(st.st_mode):
+        return None
+    loose = statmod.S_IWGRP | statmod.S_IWOTH
+    mine = (0, os.geteuid())
+    if st.st_uid not in mine or st.st_mode & loose:
+        return None
+    try:
+        holder = os.stat(os.path.dirname(real) or "/")
+    except OSError:
+        return None
+    if holder.st_uid not in mine or holder.st_mode & loose:
+        return None
+    return real
+
+
+def tool(name):
+    """The absolute path to helper `name`, or None if nothing trustworthy is
+    there. A name with a slash in it is checked where it stands."""
+    with _tools_lock:
+        found = _tools.get(name)
+    if found:
+        return found
+    if os.sep in name:
+        found = trusted_binary(name)
+    else:
+        where = shutil.which(name, path=SAFE_PATH)
+        found = trusted_binary(where) if where else None
+    if found:
+        with _tools_lock:
+            _tools[name] = found
+    return found
+
+
+def child_env():
+    """The environment a helper gets, which is not the one we were given.
+
+    Nothing reaches a child that it does not need: no LD_PRELOAD, no
+    BASH_ENV, and a PATH we chose. grim and hyprctl need to find the
+    compositor, tesseract needs a locale, and that is the whole list.
+
+    HOME is not on it. ImageMagick reads a delegates file out of the home
+    directory and will run what it finds there, and none of these five
+    helpers needs a home to do its job: checked on this machine, each one
+    behaves the same without it."""
+    env = {"PATH": SAFE_PATH}
+    for name in ("USER", "LANG", "LC_ALL", "XDG_RUNTIME_DIR",
+                 "XDG_SESSION_TYPE", "WAYLAND_DISPLAY",
+                 "HYPRLAND_INSTANCE_SIGNATURE"):
+        value = os.environ.get(name)
+        if value:
+            env[name] = value
+    return env
+
+
 # run() adds these to whatever the child itself exits with.
 RUN_TIMEOUT = 124
 RUN_OVERFLOW = 125
@@ -756,7 +833,7 @@ def kill_group(proc):
         pass
 
 
-def run(cmd, timeout=5, stdin_bytes=None, limit=CAP_PROBE):
+def run(cmd, timeout=5, stdin_bytes=None, limit=CAP_PROBE, discard=False):
     """(code, stdout, stderr), holding at most `limit` bytes of stdout.
 
     subprocess.run(capture_output=True) buffers whatever the child decides to
@@ -773,14 +850,26 @@ def run(cmd, timeout=5, stdin_bytes=None, limit=CAP_PROBE):
     `limit` bounds what this holds while the child runs. Handing the result
     back copies it once, so the peak is twice the ceiling for as long as that
     copy takes. Real frames are 3 MB against a 128 MB ceiling; the ceiling is
-    there to stop a helper that has lost its mind, not to fit one."""
+    there to stop a helper that has lost its mind, not to fit one.
+
+    `cmd[0]` is resolved through tool(), so a helper comes from SAFE_PATH or
+    it does not run. `discard` throws stdout and stderr away instead of
+    reading them, which is what a helper that forks a daemon needs: wl-copy
+    hands the clipboard to a child that outlives it, and that child would
+    hold a pipe open until somebody killed it."""
+    argv = list(cmd)
+    argv[0] = tool(argv[0])
+    if not argv[0]:
+        return RUN_MISSING, b"", b"no trusted %s" % str(cmd[0]).encode()
+    sink = subprocess.DEVNULL if discard else subprocess.PIPE
     try:
         proc = subprocess.Popen(
-            cmd,
+            argv,
             stdin=subprocess.PIPE if stdin_bytes else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True)
+            stdout=sink,
+            stderr=sink,
+            start_new_session=True,
+            env=child_env())
     except FileNotFoundError:
         return RUN_MISSING, b"", b"missing"
     except Exception as exc:
@@ -800,6 +889,8 @@ def run(cmd, timeout=5, stdin_bytes=None, limit=CAP_PROBE):
             os.set_blocking(proc.stdin.fileno(), False)
             sel.register(proc.stdin, selectors.EVENT_WRITE)
         for pipe in (proc.stdout, proc.stderr):
+            if pipe is None:               # discard=True
+                continue
             os.set_blocking(pipe.fileno(), False)
             sel.register(pipe, selectors.EVENT_READ)
 
@@ -1375,7 +1466,12 @@ def ocr_frame_file(path, timeout):
 
 
 def ocr_text(ppm, timeout):
-    code, out, _ = run(["nice", "-n", "19", "tesseract", "-", "stdout",
+    # nice resolves its own argument, so it gets a path rather than a name.
+    # run() can only vouch for argv[0].
+    reader = tool("tesseract")
+    if not reader:
+        return None
+    code, out, _ = run(["nice", "-n", "19", reader, "-", "stdout",
                         "--psm", "6"], timeout=timeout, stdin_bytes=ppm,
                        limit=CAP_OCR)
     if code != 0:
@@ -2360,6 +2456,38 @@ def cmd_text(args):
     return 0
 
 
+def cmd_copy(args):
+    """Put one frame's recognised text on the clipboard.
+
+    The panel used to do this with `sh -c '... | wl-copy'`. A non-interactive
+    shell still reads $BASH_ENV, and both python3 and wl-copy came off the
+    inherited PATH, so the words from your screen passed through two binaries
+    chosen by whatever set the environment. It happens here now, through the
+    same resolver and the same stripped environment as every other helper."""
+    if not args:
+        log("usage: hindsight copy <frame-id>")
+        return 2
+    try:
+        frame_id = int(args[0])
+    except (TypeError, ValueError):
+        log("usage: hindsight copy <frame-id>")
+        return 2
+    conn = connect()
+    row = conn.execute(
+        "SELECT text FROM frames_fts WHERE rowid=?", (frame_id,)).fetchone()
+    text = (row[0] if row else "") or ""
+    if not text:
+        return 0
+    # discard=True: wl-copy forks the clipboard owner and exits, and that
+    # child holds stdout open for as long as it serves the selection.
+    code, _, _ = run(["wl-copy"], timeout=10,
+                     stdin_bytes=text.encode("utf-8"), discard=True)
+    if code != 0:
+        log("could not reach wl-copy")
+        return 1
+    return 0
+
+
 def cmd_status(_args):
     try:
         raw = read_private(STATE_PATH)
@@ -2453,12 +2581,18 @@ def cmd_doctor(_args):
         if not ok:
             report["ok"] = False
 
-    for tool, why in (("grim", "screen capture"),
+    # tool(), not shutil.which(): doctor has to answer for the binary the
+    # recorder will actually run. One sitting somewhere the recorder refuses
+    # to look is the same as one that is missing, and saying "found" about it
+    # would send you hunting for a problem somewhere else.
+    for name, why in (("grim", "screen capture"),
                       ("magick", "webp encoding"),
                       ("tesseract", "text recognition"),
-                      ("hyprctl", "active window and monitors")):
-        path = shutil.which(tool)
-        check(tool, path is not None, path or "not found (%s)" % why)
+                      ("hyprctl", "active window and monitors"),
+                      ("wl-copy", "copying text to the clipboard")):
+        path = tool(name)
+        check(name, path is not None,
+              path or "no trusted %s on %s (%s)" % (name, SAFE_PATH, why))
 
     check("sqlite FTS5", fts_supported(), sqlite3.sqlite_version)
 
@@ -2635,6 +2769,7 @@ COMMANDS = {
     "search": cmd_search,
     "timeline": cmd_timeline,
     "text": cmd_text,
+    "copy": cmd_copy,
     "status": cmd_status,
     "pause": cmd_pause,
     "resume": cmd_resume,
@@ -2659,6 +2794,7 @@ def main(argv):
             "  search <words>        full-text search across captured screens\n"
             "  timeline [day]        frames for a day, oldest first\n"
             "  text <id>             the recognised text of one frame\n"
+            "  copy <id>             put that text on the clipboard\n"
             "  status                current recorder state\n"
             "  pause | resume | toggle\n"
             "  prune                 enforce the size and age budget now\n"

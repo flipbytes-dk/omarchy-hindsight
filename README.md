@@ -116,9 +116,13 @@ if you want a hard age ceiling regardless of space.
 
 ## Dependencies
 
-Every dependency ships in Omarchy's base install — `grim`, `tesseract`,
-`imagemagick`, `hyprctl` — and the recorder is Python standard library only.
-There is nothing to compile.
+Every dependency ships in Omarchy's base install: `grim`, `tesseract`,
+`imagemagick`, `hyprctl`, and `wl-clipboard` for the copy key. The recorder is
+Python standard library only, and there is nothing to compile.
+
+Each one gets looked up in `/usr/local/bin:/usr/bin:/bin` and nowhere else,
+and only runs if it is a regular file that neither group nor other can write,
+in a directory with the same property. `doctor` prints the path it settled on.
 
 Run `bin/hindsight doctor` to confirm all of it on your machine.
 
@@ -163,6 +167,13 @@ This plugin exists to remember your screen, so it is built to be told no.
   frame is not taken. A blocklist is worth no more than the probe behind it,
   so a timed-out `hyprctl` costs you a gap in the archive rather than a
   recorded password.
+- **Your screen only ever reaches five programs.** `grim`, `magick`,
+  `tesseract`, `hyprctl` and `wl-copy`, each resolved to an absolute path
+  before it runs. They get a seven-variable environment built from scratch:
+  the PATH Hindsight chose, and what the compositor needs to answer. No
+  `LD_PRELOAD`, no `BASH_ENV`, and no `HOME`, because ImageMagick reads a
+  delegates file out of a home directory and runs what it finds there. No
+  shell is involved at any point.
 - **A frame is whole or it never lands.** A frame grabber killed halfway
   through still hands back what it wrote, and half a screenshot decodes into a
   readable picture of the top of your screen. The PPM and the WebP each state
@@ -184,6 +195,7 @@ hindsight watch                 run the recorder (the bar does this for you)
 hindsight search <words>        full-text search across captured screens
 hindsight timeline [day]        frames for a day, oldest first
 hindsight text <id>             the recognised text of one frame
+hindsight copy <id>             put that text on the clipboard
 hindsight status                what the recorder is doing
 hindsight pause | resume | toggle
 hindsight prune                 enforce the size and age budget now
@@ -232,9 +244,10 @@ Frames and the index live in `~/.local/share/omarchy-hindsight/`.
 python3 tests/test-index.py
 ```
 
-260 offline checks covering the hashing, the blocklist, query sanitising, the
+280 offline checks covering the hashing, the blocklist, query sanitising, the
 search round trip, ring-buffer pruning, age retention, index migration, the
-frame-vanished-under-the-backfill case, and the helper ceilings — none of which
+frame-vanished-under-the-backfill case, the helper ceilings, and where a
+helper is allowed to come from — none of which
 need a screen. The ceiling checks run real processes, because a stubbed
 subprocess cannot show a deadlock, a leaked descriptor or a surviving
 grandchild.

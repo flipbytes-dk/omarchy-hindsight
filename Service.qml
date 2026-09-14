@@ -59,7 +59,7 @@ Item {
     }
     root.searching = true
     searcher.running = false
-    searcher.command = ["python3", root.helperPath, "search", text]
+    searcher.command = [root.helperPath, "search", text]
     searcher.running = true
   }
 
@@ -71,7 +71,7 @@ Item {
   function setPaused(value) {
     pauser.running = false
     pauser.answered = false
-    pauser.command = ["python3", root.helperPath, value ? "pause" : "resume"]
+    pauser.command = [root.helperPath, value ? "pause" : "resume"]
     pauser.running = true
   }
 
@@ -79,19 +79,19 @@ Item {
   // machine's measured capture rate rather than from a table of guesses.
   function refreshBudget() {
     budgeter.running = false
-    budgeter.command = ["python3", root.helperPath, "budget", "--json"]
+    budgeter.command = [root.helperPath, "budget", "--json"]
     budgeter.running = true
   }
 
   function setBudget(megabytes) {
     budgeter.running = false
-    budgeter.command = ["python3", root.helperPath, "budget", String(megabytes), "--json"]
+    budgeter.command = [root.helperPath, "budget", String(megabytes), "--json"]
     budgeter.running = true
   }
 
   function forget(target) {
     control.running = false
-    control.command = ["python3", root.helperPath, "forget", target]
+    control.command = [root.helperPath, "forget", target]
     control.running = true
     root.results = []
     root.query = ""
@@ -100,7 +100,7 @@ Item {
   Process {
     id: recorder
     running: true
-    command: ["python3", root.helperPath, "watch"]
+    command: [root.helperPath, "watch"]
 
     stdout: SplitParser {
       onRead: function (line) {
