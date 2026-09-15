@@ -301,7 +301,7 @@ open(os.environ["HINDSIGHT_CONFIG"], "w").write(
 hs.save_config({"budgetMB": 2048})
 saved = hs.load_config()
 check("setting a budget keeps the settings it was not asked about",
-      saved["budgetMB"] == 2048 and saved["blocklist"] == ["mine"]
+      saved["budgetMB"] == 2048 and "mine" in saved["blocklist"]
       and saved["interval"] == 9.5, saved)
 
 print("\n-- the budget must cover everything on disk, not just pictures --")
@@ -1019,7 +1019,7 @@ check("but the daemon's own surfaces are",
 check("an empty answer from hyprctl is not an empty screen",
       with_run(lambda *a, **k: (0, b"   ", b""),
                lambda: hs.visible_layers("DP-1")) == (False, []))
-check("an explicit empty list disables layer blocking",
+check("blocked_layer itself blocks nothing when handed an empty list",
       hs.blocked_layer({"blocklistLayers": []}, ["mako"]) == "")
 check("and an absent key restores the defaults",
       hs.blocked_layer({}, ["mako"]) == "mako")
@@ -1559,6 +1559,85 @@ check("a discarded run still reports the helper's exit code",
 
 check("copy wants a frame id", hs.cmd_copy([]) == 2)
 check("and refuses one that is not a number", hs.cmd_copy(["1; rm -rf /"]) == 2)
+
+print("\n-- a saved blocklist adds to the defaults, it does not replace them --")
+
+CFG_PATH = os.environ["HINDSIGHT_CONFIG"]
+
+
+def with_config(text):
+    open(CFG_PATH, "w").write(text)
+    try:
+        return hs.load_config()
+    finally:
+        try:
+            os.remove(CFG_PATH)
+        except OSError:
+            pass
+
+
+# The bug this section exists for: one added app used to delete eleven
+# protections, and the user who added it had no way to notice.
+one = with_config('{"blocklist": ["my-bank"]}')
+check("the app you added is blocked", hs.blocked_by(one, "my-bank", "") == "my-bank")
+for keeper in ("1password", "bitwarden", "keepassxc", "incognito",
+               "screensaver", "org.omarchy.screensaver"):
+    # Which rule answers does not matter - "org.omarchy.screensaver" is
+    # caught by the "screensaver" entry, whichever comes first. That a rule
+    # answers at all is the protection.
+    check("and %s is still blocked beside it" % keeper,
+          hs.blocked_by(one, keeper, "") != "")
+check("every default survives an addition",
+      all(rule in one["blocklist"] for rule in hs.DEFAULTS["blocklist"]),
+      one["blocklist"])
+
+layers = with_config('{"blocklistLayers": ["my-osd"]}')
+check("an added layer rule keeps the notification daemons",
+      hs.blocked_layer(layers, ["mako"]) == "mako"
+      and hs.blocked_layer(layers, ["my-osd"]) == "my-osd")
+
+# An empty list used to switch the protection off entirely. It cannot any
+# more: a privacy default is not something a stray [] should be able to
+# clear, and there is a precise way to drop one rule.
+empty = with_config('{"blocklist": [], "blocklistLayers": []}')
+check("an empty list no longer disables the app blocklist",
+      hs.blocked_by(empty, "keepassxc", "") == "keepassxc")
+check("nor the layer blocklist", hs.blocked_layer(empty, ["hyprlock"]) == "hyprlock")
+
+# The escape hatch, because "notifications" cannot be told from a bar named
+# for what it holds, and somebody has to be able to take it out.
+minus = with_config('{"blocklistLayers": ["-notifications"]}')
+check("a leading - drops one default",
+      hs.blocked_layer(minus, ["notifications"]) == "")
+check("and leaves the rest of them alone",
+      hs.blocked_layer(minus, ["mako"]) == "mako"
+      and hs.blocked_layer(minus, ["hyprlock"]) == "hyprlock")
+check("removal ignores case",
+      with_config('{"blocklist": ["-KeePassXC"]}')["blocklist"].count("keepassxc") == 0)
+check("a bare - removes nothing",
+      hs.blocked_by(with_config('{"blocklist": ["-", "  "]}'), "keepassxc", "")
+      == "keepassxc")
+
+dupes = with_config('{"blocklist": ["1Password", "my-bank", "my-bank"]}')
+check("a default restated in the user's own casing is not listed twice",
+      len([r for r in dupes["blocklist"] if r.lower() == "1password"]) == 1,
+      dupes["blocklist"])
+check("nor is one the user repeated",
+      len([r for r in dupes["blocklist"] if r == "my-bank"]) == 1)
+
+# A string where a list belongs used to be iterated character by character,
+# so "mine" blocked every window whose title held an m, i, n or e.
+text = with_config('{"blocklist": "mine"}')
+check("a blocklist that is not a list falls back to the defaults",
+      text["blocklist"] == hs.DEFAULTS["blocklist"], text["blocklist"])
+check("so a single letter does not block the whole screen",
+      hs.blocked_by(text, "email", "") == "")
+
+# Titles are regexes, not tokens: nothing is merged and nothing is stripped.
+titles = with_config('{"blocklistTitles": ["-\\\\d{4}$"]}')
+check("a title pattern beginning with - is kept as written",
+      titles["blocklistTitles"] == ["-\\d{4}$"], titles["blocklistTitles"])
+check("and it still matches", hs.blocked_by(titles, "", "acct-1234") != "")
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 if FAIL:

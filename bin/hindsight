@@ -108,6 +108,45 @@ def config_stamp():
         return None
 
 
+BLOCK_LISTS = ("blocklist", "blocklistLayers", "blocklistTitles")
+
+
+def merge_rules(defaults, user):
+    """The defaults, plus what the user added, minus what they took out.
+
+    A saved list used to replace the defaults outright. So a config that
+    reads like an addition - one line naming your own bank - acted like a
+    deletion, and quietly took the password managers, the private-browsing
+    titles and the screensaver out of the blocklist with it. Nobody edits a
+    privacy setting expecting to lose the other eleven.
+
+    A leading "-" takes one default back out, which keeps the escape hatch
+    for a rule that over-blocks: a status bar named "notifications-bar"
+    cannot be told apart from a notification daemon by name, so it needs to
+    be droppable. Matching is case-insensitive, and so is the removal."""
+    drop = set()
+    added = []
+    for entry in user or []:
+        token = str(entry).strip()
+        if token.startswith("-"):
+            gone = token[1:].strip().lower()
+            if gone:
+                drop.add(gone)
+            continue
+        if token:
+            added.append(token)
+    merged = []
+    seen = set()
+    for entry in list(defaults) + added:
+        token = str(entry).strip()
+        low = token.lower()
+        if not token or low in drop or low in seen:
+            continue
+        seen.add(low)
+        merged.append(token)
+    return merged
+
+
 def load_config():
     cfg = dict(DEFAULTS)
     try:
@@ -121,10 +160,29 @@ def load_config():
     except Unreadable as exc:
         # Loud, because the alternative is a user whose blocklist quietly
         # never applied.
-        log("cannot read your config (%s); running on defaults, and your "
-            "blocklist is NOT in effect" % exc)
+        log("cannot read your config (%s); running on defaults, so the "
+            "built-in blocklist applies but anything you added to it is "
+            "NOT in effect" % exc)
     except Exception as exc:
         log("config unreadable (%s), using defaults" % exc)
+    # Block lists extend the defaults; they no longer replace them. A list
+    # that is not a list at all would be iterated character by character
+    # ("mine" blocking on "m", "i", "n", "e"), so it falls back instead.
+    for key in BLOCK_LISTS:
+        value = cfg[key]
+        if not isinstance(value, list):
+            log("config value for %s (%r) is not a list; using the defaults"
+                % (key, value))
+            value = []
+        if key == "blocklistTitles":
+            # Regular expressions rather than tokens. A pattern starting
+            # with "-" is one a user may reasonably write, so there is no
+            # removal syntax here, and the default list is empty so there
+            # is nothing to merge. Entries are kept exactly as written.
+            cfg[key] = list(value)
+        else:
+            cfg[key] = merge_rules(DEFAULTS[key], value)
+
     # These coercions used to sit outside the try above, so "interval": "fast"
     # raised on every invocation and Service.qml respawned the recorder every
     # two seconds forever. A bad value falls back to the default and says so.
@@ -1323,8 +1381,8 @@ def blocked_layer(cfg, namespaces):
             #
             # A bar named "notifications-bar" does not, and there is no way
             # to tell it apart from a notification daemon by name. It blocks,
-            # the panel names the rule that did it, and the rule can be taken
-            # out of blocklistLayers. Erring the other way would mean
+            # the panel names the rule that did it, and "-notifications" in
+            # blocklistLayers takes that one rule back out. Erring the other way would mean
             # recording notification popups on every desktop that names the
             # surface for what it holds.
             parts = re.split(r"[-._:/]", hay)

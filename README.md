@@ -220,10 +220,21 @@ hindsight config                print (creating if needed) the config path
 
 ## Configuration
 
-`~/.config/omarchy-hindsight/config.json`. Both block lists are shown here in
-full, because writing one replaces the defaults rather than adding to them:
-drop an entry and you lose that protection. Setting a list to `[]` disables it
-entirely; removing the key restores the defaults.
+`~/.config/omarchy-hindsight/config.json`. Block lists **add to** the built-in
+rules rather than replacing them, so naming your own bank does not quietly
+delete the password managers. The defaults are shown here for reference; you
+only need to write the lines you are adding.
+
+To take a built-in rule back out, write it with a leading `-`. That matters for
+`blocklistLayers`, where a status bar named `notifications-bar` cannot be told
+apart from a notification daemon by its name alone:
+
+```json
+{ "blocklistLayers": ["-notifications"] }
+```
+
+`[]` no longer switches a list off — a stray empty list should not be able to
+clear a privacy default. Remove rules one at a time with `-`.
 
 ```json
 {
@@ -248,6 +259,9 @@ entirely; removing the key restores the defaults.
 `changeBits` is how many of the 1024 bits of a frame's signature must differ
 before the screen counts as a new one. Lower keeps more; higher keeps less.
 `blocklistTitles` entries are regular expressions matched against window titles.
+They are the one exception to the rules above: the default list is empty, so
+there is nothing to add to, and a pattern is kept exactly as written — a leading
+`-` there is part of your regex, not a removal.
 
 Frames and the index live in `~/.local/share/omarchy-hindsight/`.
 
@@ -257,7 +271,7 @@ Frames and the index live in `~/.local/share/omarchy-hindsight/`.
 python3 tests/test-index.py
 ```
 
-280 offline checks covering the hashing, the blocklist, query sanitising, the
+302 offline checks covering the hashing, the blocklist, query sanitising, the
 search round trip, ring-buffer pruning, age retention, index migration, the
 frame-vanished-under-the-backfill case, the helper ceilings, and where a
 helper is allowed to come from — none of which
