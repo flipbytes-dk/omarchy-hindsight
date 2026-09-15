@@ -1532,8 +1532,13 @@ check("and gets the PATH we chose, not the one we were handed",
 # ImageMagick reads a delegates file out of the home directory and runs what
 # it finds there. None of the five helpers needs a home to do its job.
 check("nor HOME", "HOME" not in seen, sorted(seen))
+# Tesseract takes every core it can see. One thread reads the same page for a
+# third of the CPU, and OCR is off the capture thread anyway.
+check("and tesseract is held to one thread",
+      seen.get("OMP_THREAD_LIMIT") == "1", seen.get("OMP_THREAD_LIMIT"))
 check("while keeping what grim needs to find the compositor",
       set(seen) <= {"PATH", "USER", "LANG", "LC_ALL", "XDG_RUNTIME_DIR",
+                    "OMP_THREAD_LIMIT",
                     "XDG_SESSION_TYPE", "WAYLAND_DISPLAY",
                     "HYPRLAND_INSTANCE_SIGNATURE", "PWD", "SHLVL", "_"},
       sorted(seen))

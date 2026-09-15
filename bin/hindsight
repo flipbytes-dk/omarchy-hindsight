@@ -797,8 +797,16 @@ def child_env():
     HOME is not on it. ImageMagick reads a delegates file out of the home
     directory and will run what it finds there, and none of these five
     helpers needs a home to do its job: checked on this machine, each one
-    behaves the same without it."""
-    env = {"PATH": SAFE_PATH}
+    behaves the same without it.
+
+    OMP_THREAD_LIMIT is the battery setting. Tesseract builds with OpenMP and
+    takes every core it can see: measured on a 1280x800 frame, 6.4 to 7.5 CPU
+    seconds across 3.2 threads to finish in 2.0 seconds. One thread does the
+    same page in 2.7 CPU seconds and 2.7 wall seconds, character for
+    character. OCR runs off the capture thread at nice 19, so the extra
+    second of wall clock costs nothing and the four saved CPU seconds are
+    four seconds the fan does not spin for."""
+    env = {"PATH": SAFE_PATH, "OMP_THREAD_LIMIT": "1"}
     for name in ("USER", "LANG", "LC_ALL", "XDG_RUNTIME_DIR",
                  "XDG_SESSION_TYPE", "WAYLAND_DISPLAY",
                  "HYPRLAND_INSTANCE_SIGNATURE"):

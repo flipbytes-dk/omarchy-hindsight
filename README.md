@@ -62,17 +62,30 @@ and no portal. Measured on a 1280x800 panel: **40 ms a frame**.
 
 Measured, not estimated:
 
-| step | cost |
-| --- | --- |
-| capture a frame (`grim`) | 40 ms |
-| decide whether it changed | 0.4 ms, no subprocess |
-| store a changed frame (WebP) | ~48 KB, 99 ms |
-| read the words (`tesseract`) | ~1.4 s, off the capture thread |
-| search 60k characters | 50 ms |
+| step | wall | cpu |
+| --- | --- | --- |
+| capture a frame (`grim`) | 15 ms | 6 ms |
+| decide whether it changed | 0.4 ms | no subprocess |
+| store a changed frame (`magick`) | 130 ms | 130 ms, about 72 KB |
+| read the words (`tesseract`) | 2.7 s | 2.7 s, one thread, nice 19 |
+| search 60k characters | 50 ms | |
 
-An unchanged screen costs only the first two steps, so an idle desktop is
-nearly free and stores nothing at all. Frames are kept in a ring buffer inside
-a size budget you set; the oldest go first.
+An unchanged screen costs only the first two steps, so an idle desktop stores
+nothing and reads nothing. Frames are kept in a ring buffer inside a size
+budget you set; the oldest go first.
+
+OCR is the whole cost, and it is capped at one core. Tesseract builds with
+OpenMP and will take every core it can see: the same page finished in 2.0
+seconds of wall clock by spending 7 CPU seconds across 3.2 threads. Hindsight
+gives it `OMP_THREAD_LIMIT=1`, which reads the identical characters for 2.7
+CPU seconds. A second of wall clock is worth nothing here, because OCR runs
+off the capture thread behind a queue, and on a laptop those four CPU seconds
+are four seconds of fan.
+
+Measured over three minutes of ordinary work at a 4 second interval: 8 frames
+kept, 28.8 CPU seconds, 16% of one core. The same three minutes before the
+thread limit cost 38%. A quiet desktop costs a screenshot and a hash every 4
+seconds and nothing else.
 
 Memory stays flat because every helper has a ceiling. Hindsight drains the
 pipes from `grim`, `magick` and `tesseract` as they fill, and kills a helper
